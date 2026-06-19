@@ -1,15 +1,11 @@
-"""
-Dataset loading for pyvae.
-"""
-
 from pathlib import Path
-from urllib.request import urlretrieve  # noqa: F401
+from urllib.request import urlretrieve  
 
-import scanpy as sc  # noqa: F401
+import scanpy as sc  
 
 
 def load_kang(data_folder=".", normalize=True, n_genes=None, return_path=False):
-    """
+   """
     Load the Kang et al. 2018 PBMC IFN-beta stimulation dataset.
 
     This dataset contains ~25 000 peripheral blood mononuclear cells (PBMCs)
@@ -48,7 +44,47 @@ def load_kang(data_folder=".", normalize=True, n_genes=None, return_path=False):
     Returns
     -------
     adata : AnnData  (or Path if return_path is True)
-    """
-    # source_path: path to the raw downloaded file
-    # out_path: path where the processed file is saved
-    raise NotImplementedError
+   """
+
+   KANG_URL = "https://figshare.com/ndownloader/files/34464122"
+   
+   data_folder = Path(data_folder)
+   data_folder.mkdir(parents=True, exist_ok=True)
+
+   source_path = data_folder / "kang_counts_25k.h5ad"
+   out_path = data_folder / "kang_processed.h5ad"
+
+   if not source_path.exists() or source_path.stat().st_size == 0:
+      urlretrieve(KANG_URL, source_path)
+
+   try:
+      adata = sc.read_h5ad(source_path)
+   except Exception:
+      source_path.unlink(missing_ok=True)
+      urlretrieve(KANG_URL, source_path)
+      adata = sc.read_h5ad(source_path)
+
+   adata.obs["label"] = adata.obs["label"].replace({"ctrl": "control", "stim": "stimulated"})
+   adata.obs = adata.obs.rename(columns={"label": "condition"})
+
+   adata.layers["counts"] = adata.X.copy()
+
+   if normalize:
+      sc.pp.normalize_total(adata)
+      sc.pp.log1p(adata)
+
+   if n_genes is not None:
+      sc.pp.highly_variable_genes(
+         adata,
+         n_top_genes=n_genes,
+         flavor="seurat_v3",
+         layer="counts",
+      )
+      adata = adata[:, adata.var["highly_variable"]].copy()
+
+   adata.write_h5ad(out_path)
+
+   if return_path:
+      return out_path
+
+   return adata

@@ -1,16 +1,9 @@
-"""
-Training loop for InformedVAE with early stopping.
-"""
-
 from __future__ import annotations
-
-import torch  # noqa: F401
-from torch.utils.data import DataLoader, TensorDataset  # noqa: F401
-
+import torch  
+from torch.utils.data import DataLoader, TensorDataset  
 from pyvae.models import InformedVAE
 
-
-def train_ivae(  # pylint: disable=too-many-arguments,too-many-locals,too-many-positional-arguments
+def train_ivae(  
     model: InformedVAE,
     x_train,
     x_val,
@@ -20,54 +13,64 @@ def train_ivae(  # pylint: disable=too-many-arguments,too-many-locals,too-many-p
     lr: float = 1e-5,
     device: str = "cpu",
 ) -> tuple[InformedVAE, dict]:
-    """
-    Train InformedVAE with Adam and early stopping.
 
-    Implement a standard mini-batch training loop:
+    model.to(device)
 
-    - Move the model to the target device.
-    - Use the Adam optimiser with the given learning rate.  Set eps=1e-7
-      (lower than the default) for better numerical stability with small lr.
-    - Convert the DataFrames to float32 tensors and create a shuffled
-      DataLoader for the training set.
-    - For each epoch, run a train phase (model.train()) over all mini-batches
-      followed by a validation phase (model.eval(), no gradient computation).
-    - After each backward pass, clip gradients before the optimiser step.
-      The reconstruction loss is scaled by n_genes, so raw gradients can be
-      large at the start of training.
-    - Implement early stopping: keep track of the best validation loss seen
-      so far and a patience counter.  Stop early if the counter reaches the
-      patience limit.
-    - Append the per-epoch train and validation losses to history.
+    x_train_tensor = torch.tensor(x_train.values, dtype=torch.float32)
+    x_val_tensor = torch.tensor(x_val.values, dtype=torch.float32)
 
-    Parameters
-    ----------
-    model : InformedVAE
-    x_train : pd.DataFrame, dtype compatible with float32
-        Training split - rows are cells, columns are genes.
-    x_val : pd.DataFrame, dtype compatible with float32
-        Validation split.
-    epochs : int
-        Maximum number of full passes over the training data.
-    batch_size : int
-        Number of cells per mini-batch.
-    patience : int
-        Epochs with no improvement on val_loss before early stopping fires.
-    lr : float
-        Learning rate for Adam.
-    device : str
-        "cpu" or "cuda".
+    train_dataset = TensorDataset(x_train_tensor)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-    Returns
-    -------
-    model : InformedVAE
-        Trained model, still on device.
-    history : dict
-        {"train": [...], "val": [...]} - one entry per completed epoch.
-    """
-    from tqdm.auto import tqdm  # noqa: PLC0415
+    x_val_tensor = x_val_tensor.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-7)
+    history = {"train": [], "val": []}
+    best_val_loss = float("inf")     
+    patience_counter = 0
 
-    # optimizer: Adam optimiser for model.parameters()
-    # loader: DataLoader wrapping the training tensor
-    # history: dict with "train" and "val" loss lists
-    raise NotImplementedError
+    from tqdm.auto import tqdm 
+    for epoch in tqdm(range(epochs)):
+        model.train()                                
+        epoch_train_loss = 0.0                      
+        n_batches = 0
+
+        for (x_batch,) in train_loader:            
+            x_batch = x_batch.to(device)
+        
+            optimizer.zero_grad()                    
+            recon, mu, log_var, h = model(x_batch)   
+            loss = model.loss(x_batch, recon, mu, log_var, h)
+            loss.backward()                          
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  
+            optimizer.step()                         
+        
+            epoch_train_loss += loss.item()          
+            n_batches += 1
+
+        avg_train_loss = epoch_train_loss / n_batches  
+    
+        model.eval()                                
+        with torch.no_grad():                 
+            recon, mu, log_var, h = model(x_val_tensor)
+            val_loss = model.loss(x_val_tensor, recon, mu, log_var, h).item()
+
+
+        history["train"].append(avg_train_loss)
+        history["val"].append(val_loss)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                break
+    
+    return model, history
+
+
+
+    
+
+    
+    

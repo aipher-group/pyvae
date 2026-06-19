@@ -1,11 +1,3 @@
-"""
-Biological adjacency matrix utilities for pyvae.
-
-These helpers bridge the gap between biological databases (Reactome) and the
-PyTorch model: they parse pathway files, build binary gene-pathway matrices,
-and bundle everything into a configuration object consumed by the model.
-"""
-
 from dataclasses import dataclass, field
 from itertools import chain, repeat  # noqa: F401
 from pathlib import Path
@@ -13,11 +5,7 @@ from typing import Any, List, Optional
 
 import pandas as pd
 
-
-# -- Data classes --------------------------------------------------------------
-
-
-@dataclass  # pylint: disable=too-many-instance-attributes
+@dataclass 
 class InformedModelConfig:
     """
     Container for the biological configuration of an iVAE model.
@@ -55,9 +43,6 @@ class InformedModelConfig:
     model_layer: List[Any] = field(default_factory=list)
 
 
-# -- Adjacency helpers ---------------------------------------------------------
-
-
 def get_reactome_adj(pth: Optional[Path] = None) -> pd.DataFrame:
     """
     Parse a Reactome GMT file into a binary gene x pathway indicator matrix.
@@ -88,8 +73,25 @@ def get_reactome_adj(pth: Optional[Path] = None) -> pd.DataFrame:
         raise ValueError(
             "pth is required for pyvae - pass the GMT file path explicitly."
         )
-    raise NotImplementedError
+    
+    pathways = {}
+    with Path(pth).open("r") as f:
+        for line in f:
+            name, _, *genes = line.strip().split("\t")
+            pathways[name] = genes
 
+    records = chain.from_iterable(
+        zip(repeat(name), genes) for name, genes in pathways.items()
+    )
+    df_long = pd.DataFrame(records, columns=["geneset", "genesymbol"])
+
+    reactome = (
+        df_long.drop_duplicates()
+        .assign(belongs_to=1)
+        .pivot(columns="geneset", index="genesymbol", values="belongs_to")
+        .fillna(0)
+    )
+    return reactome 
 
 def get_reactome_hierarchical_adj(pth: Any) -> pd.DataFrame:
     """
@@ -112,8 +114,8 @@ def get_reactome_hierarchical_adj(pth: Any) -> pd.DataFrame:
     pd.DataFrame, shape (n_genes, n_pathways)
         Binary indicator matrix.
     """
-    raise NotImplementedError
-
+    #return pd.read_csv(pth, sep="\t", index_col=0)
+    return pd.read_csv(pth, sep="\t", index_col=0, keep_default_na=False, na_values=[""])
 
 def sync_gexp_adj(genes, adj: pd.DataFrame):
     """
@@ -137,10 +139,10 @@ def sync_gexp_adj(genes, adj: pd.DataFrame):
     adj_filtered : pd.DataFrame
         adj restricted to gene_list rows (all columns kept).
     """
-    raise NotImplementedError
-
-
-# -- Config builder ------------------------------------------------------------
+    
+    gene_list = adj.index.intersection(genes)       
+    adj_filtered = adj.loc[gene_list, :]            
+    return gene_list, adj_filtered                  
 
 
 def build_model_config(
@@ -195,14 +197,42 @@ def build_model_config(
                 "resources_dir must be provided for ivae_reactome_hierarchical_d2 "
                 "(directory containing Matrix_1_genes_D2.tsv)."
             )
-        raise NotImplementedError
+        adj_path = Path(resources_dir) / "Matrix_1_genes_D2.tsv"
+        adj = get_reactome_hierarchical_adj(adj_path)
+    
+        input_genes, adj = sync_gexp_adj(genes, adj)
+
+        return InformedModelConfig(
+            model_kind=model_kind,
+            frac=frac if frac is not None else 0.0,
+            n_encoding_layers=2,
+            adj_name=["d2_pathways"],
+            adj_activ=["tanh"],
+            input_genes=input_genes,
+            layer_entity_names=[adj.columns],
+            model_layer=[adj],
+        )
 
     if model_kind == "ivae_reactome":
         if resources_dir is None:
             raise ValueError(
                 "resources_dir must be the path to the Reactome GMT file for ivae_reactome."
             )
-        raise NotImplementedError
+        adj = get_reactome_adj(resources_dir)
+    
+        input_genes, adj = sync_gexp_adj(genes, adj)
+
+        return InformedModelConfig(
+            model_kind=model_kind,
+            frac=frac if frac is not None else 0.0,
+            n_encoding_layers=2,
+            adj_name=["pathways"],          
+            adj_activ=["tanh"],
+            input_genes=input_genes,
+            layer_entity_names=[adj.columns],
+            model_layer=[adj],
+        )
+
 
     raise NotImplementedError(
         f"model_kind '{model_kind}' is not supported. "
