@@ -1,5 +1,5 @@
 [workspace]
-name = "Informed-iVAE"
+name = "pyvae"
 version = "0.0.1"
 authors = ["Amir Aynede <amiraynede@gmail.com>", "Carlos Loucera <clou@us.es>"]
 channels = ["conda-forge", "pytorch", "nvidia"]
