@@ -1,9 +1,12 @@
 from __future__ import annotations
-import torch  
-from torch.utils.data import DataLoader, TensorDataset  
+
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+
 from pyvae.models import InformedVAE
 
-def train_ivae(  
+
+def train_ivae(
     model: InformedVAE,
     x_train,
     x_val,
@@ -25,35 +28,35 @@ def train_ivae(
     x_val_tensor = x_val_tensor.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-7)
     history = {"train": [], "val": []}
-    best_val_loss = float("inf")     
+    best_val_loss = float("inf")
     patience_counter = 0
 
-    from tqdm.auto import tqdm 
+    from tqdm.auto import tqdm
+
     for epoch in tqdm(range(epochs)):
-        model.train()                                
-        epoch_train_loss = 0.0                      
+        model.train()
+        epoch_train_loss = 0.0
         n_batches = 0
 
-        for (x_batch,) in train_loader:            
+        for (x_batch,) in train_loader:
             x_batch = x_batch.to(device)
-        
-            optimizer.zero_grad()                    
-            recon, mu, log_var, h = model(x_batch)   
+
+            optimizer.zero_grad()
+            recon, mu, log_var, h = model(x_batch)
             loss = model.loss(x_batch, recon, mu, log_var, h)
-            loss.backward()                          
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  
-            optimizer.step()                         
-        
-            epoch_train_loss += loss.item()          
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            epoch_train_loss += loss.item()
             n_batches += 1
 
-        avg_train_loss = epoch_train_loss / n_batches  
-    
-        model.eval()                                
-        with torch.no_grad():                 
+        avg_train_loss = epoch_train_loss / n_batches
+
+        model.eval()
+        with torch.no_grad():
             recon, mu, log_var, h = model(x_val_tensor)
             val_loss = model.loss(x_val_tensor, recon, mu, log_var, h).item()
-
 
         history["train"].append(avg_train_loss)
         history["val"].append(val_loss)
@@ -65,12 +68,5 @@ def train_ivae(
             patience_counter += 1
             if patience_counter >= patience:
                 break
-    
+
     return model, history
-
-
-
-    
-
-    
-    

@@ -1,11 +1,11 @@
 from pathlib import Path
-from urllib.request import urlretrieve  
+from urllib.request import urlretrieve
 
-import scanpy as sc  
+import scanpy as sc
 
 
 def load_kang(data_folder=".", normalize=True, n_genes=None, return_path=False):
-   """
+    """
     Load the Kang et al. 2018 PBMC IFN-beta stimulation dataset.
 
     This dataset contains ~25 000 peripheral blood mononuclear cells (PBMCs)
@@ -44,47 +44,49 @@ def load_kang(data_folder=".", normalize=True, n_genes=None, return_path=False):
     Returns
     -------
     adata : AnnData  (or Path if return_path is True)
-   """
+    """
 
-   KANG_URL = "https://figshare.com/ndownloader/files/34464122"
-   
-   data_folder = Path(data_folder)
-   data_folder.mkdir(parents=True, exist_ok=True)
+    KANG_URL = "https://figshare.com/ndownloader/files/34464122"
 
-   source_path = data_folder / "kang_counts_25k.h5ad"
-   out_path = data_folder / "kang_processed.h5ad"
+    data_folder = Path(data_folder)
+    data_folder.mkdir(parents=True, exist_ok=True)
 
-   if not source_path.exists() or source_path.stat().st_size == 0:
-      urlretrieve(KANG_URL, source_path)
+    source_path = data_folder / "kang_counts_25k.h5ad"
+    out_path = data_folder / "kang_processed.h5ad"
 
-   try:
-      adata = sc.read_h5ad(source_path)
-   except Exception:
-      source_path.unlink(missing_ok=True)
-      urlretrieve(KANG_URL, source_path)
-      adata = sc.read_h5ad(source_path)
+    if not source_path.exists() or source_path.stat().st_size == 0:
+        urlretrieve(KANG_URL, source_path)
 
-   adata.obs["label"] = adata.obs["label"].replace({"ctrl": "control", "stim": "stimulated"})
-   adata.obs = adata.obs.rename(columns={"label": "condition"})
+    try:
+        adata = sc.read_h5ad(source_path)
+    except Exception:
+        source_path.unlink(missing_ok=True)
+        urlretrieve(KANG_URL, source_path)
+        adata = sc.read_h5ad(source_path)
 
-   adata.layers["counts"] = adata.X.copy()
+    adata.obs["label"] = adata.obs["label"].replace(
+        {"ctrl": "control", "stim": "stimulated"}
+    )
+    adata.obs = adata.obs.rename(columns={"label": "condition"})
 
-   if normalize:
-      sc.pp.normalize_total(adata)
-      sc.pp.log1p(adata)
+    adata.layers["counts"] = adata.X.copy()
 
-   if n_genes is not None:
-      sc.pp.highly_variable_genes(
-         adata,
-         n_top_genes=n_genes,
-         flavor="seurat_v3",
-         layer="counts",
-      )
-      adata = adata[:, adata.var["highly_variable"]].copy()
+    if normalize:
+        sc.pp.normalize_total(adata)
+        sc.pp.log1p(adata)
 
-   adata.write_h5ad(out_path)
+    if n_genes is not None:
+        sc.pp.highly_variable_genes(
+            adata,
+            n_top_genes=n_genes,
+            flavor="seurat_v3",
+            layer="counts",
+        )
+        adata = adata[:, adata.var["highly_variable"]].copy()
 
-   if return_path:
-      return out_path
+    adata.write_h5ad(out_path)
 
-   return adata
+    if return_path:
+        return out_path
+
+    return adata

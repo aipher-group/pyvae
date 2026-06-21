@@ -5,7 +5,8 @@ from typing import Any, List, Optional
 
 import pandas as pd
 
-@dataclass 
+
+@dataclass
 class InformedModelConfig:
     """
     Container for the biological configuration of an iVAE model.
@@ -73,7 +74,7 @@ def get_reactome_adj(pth: Optional[Path] = None) -> pd.DataFrame:
         raise ValueError(
             "pth is required for pyvae - pass the GMT file path explicitly."
         )
-    
+
     pathways = {}
     with Path(pth).open("r") as f:
         for line in f:
@@ -91,7 +92,8 @@ def get_reactome_adj(pth: Optional[Path] = None) -> pd.DataFrame:
         .pivot(columns="geneset", index="genesymbol", values="belongs_to")
         .fillna(0)
     )
-    return reactome 
+    return reactome
+
 
 def get_reactome_hierarchical_adj(pth: Any) -> pd.DataFrame:
     """
@@ -114,8 +116,11 @@ def get_reactome_hierarchical_adj(pth: Any) -> pd.DataFrame:
     pd.DataFrame, shape (n_genes, n_pathways)
         Binary indicator matrix.
     """
-    #return pd.read_csv(pth, sep="\t", index_col=0)
-    return pd.read_csv(pth, sep="\t", index_col=0, keep_default_na=False, na_values=[""])
+    # return pd.read_csv(pth, sep="\t", index_col=0)
+    return pd.read_csv(
+        pth, sep="\t", index_col=0, keep_default_na=False, na_values=[""]
+    )
+
 
 def sync_gexp_adj(genes, adj: pd.DataFrame):
     """
@@ -139,10 +144,10 @@ def sync_gexp_adj(genes, adj: pd.DataFrame):
     adj_filtered : pd.DataFrame
         adj restricted to gene_list rows (all columns kept).
     """
-    
-    gene_list = adj.index.intersection(genes)       
-    adj_filtered = adj.loc[gene_list, :]            
-    return gene_list, adj_filtered                  
+
+    gene_list = adj.index.intersection(genes)
+    adj_filtered = adj.loc[gene_list, :]
+    return gene_list, adj_filtered
 
 
 def build_model_config(
@@ -199,7 +204,7 @@ def build_model_config(
             )
         adj_path = Path(resources_dir) / "Matrix_1_genes_D2.tsv"
         adj = get_reactome_hierarchical_adj(adj_path)
-    
+
         input_genes, adj = sync_gexp_adj(genes, adj)
 
         return InformedModelConfig(
@@ -219,20 +224,19 @@ def build_model_config(
                 "resources_dir must be the path to the Reactome GMT file for ivae_reactome."
             )
         adj = get_reactome_adj(resources_dir)
-    
+
         input_genes, adj = sync_gexp_adj(genes, adj)
 
         return InformedModelConfig(
             model_kind=model_kind,
             frac=frac if frac is not None else 0.0,
             n_encoding_layers=2,
-            adj_name=["pathways"],          
+            adj_name=["pathways"],
             adj_activ=["tanh"],
             input_genes=input_genes,
             layer_entity_names=[adj.columns],
             model_layer=[adj],
         )
-
 
     raise NotImplementedError(
         f"model_kind '{model_kind}' is not supported. "
