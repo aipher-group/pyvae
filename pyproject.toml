@@ -51,7 +51,7 @@ exclude = ["tests*"]
 
 [tool.pixi.workspace]
 name = "pyvae"
-version = "1.0.0"
+version = "0.0.1"
 authors = ["Amir Aynede <amiraynede@gmail.com>", "Carlos Loucera <clou@us.es>"]
 channels = ["conda-forge", "pytorch", "nvidia"]
 platforms = ["osx-arm64", "linux-64"]
@@ -66,7 +66,7 @@ preview = ["pixi-build"]
 # single `noarch: python` conda package that installs on every platform.
 [tool.pixi.package]
 name = "pyvae"
-version = "1.0.0"
+version = "0.0.1"
 
 [tool.pixi.package.build.backend]
 name = "pixi-build-python"
