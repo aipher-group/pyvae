@@ -1,253 +1,195 @@
-# pyvae - Student Edition
+# pyvae
 
-Implement an **Informed Variational Autoencoder (iVAE)** in PyTorch.
-The encoder is biologically constrained: each gene can only influence the
-pathways that contain it, according to the [Reactome](https://reactome.org/)
-database.
+**Informed Variational Autoencoder (iVAE) for gene expression, in PyTorch.**
 
----
+`pyvae` implements a VAE whose encoder is *biologically constrained*: each gene
+can only influence the pathways that contain it, according to the
+[Reactome](https://reactome.org/) database. The result is a latent space whose
+dimensions correspond to interpretable biological pathways rather than opaque
+features.
 
-## 1  Background
-
-### What is a VAE?
-
-A Variational Autoencoder learns a *compressed* (latent) representation $z$
-of the input $x$ by maximising the Evidence Lower Bound (ELBO):
-
-$$
-\text{ELBO} = \mathbb{E}_{q(z|x)}[\log p(x|z)] - \text{KL}(q(z|x) \,\|\, p(z))
-$$
-
-- **Reconstruction term** - the decoder should reproduce the input from $z$.
-- **KL divergence** - the posterior $q(z|x)$ should stay close to the
-  standard Gaussian prior $p(z) = \mathcal{N}(0, I)$.
-
-The closed-form KL for Gaussian distributions is:
-
-$$
-\mathcal{L}_{\text{KL}} = -\frac{1}{2}\,\mathbb{E}\!\left[
-  1 + \log\sigma^2 - \mu^2 - \sigma^2
-\right]
-$$
-
-### Why biological constraints?
-
-Gene expression is high-dimensional (~20 000 genes) but structured: genes
-work together in *pathways*.  By restricting the encoder's first layer to
-only allow gene -> pathway connections that exist in Reactome, we:
-
-- reduce the number of parameters,
-- make the latent representation interpretable (each node = a pathway),
-- incorporate prior biological knowledge.
-
-The constraint is enforced via a **binary mask** on the weight matrix:
-
-$$
-W_{\text{eff}} = W \odot M
-$$
-
-where $M_{ji} = 1$ only if gene $i$ belongs to pathway $j$, and $\odot$
-denotes the element-wise (Hadamard) product.
-
-### Reparameterisation trick
-
-Sampling $z \sim \mathcal{N}(\mu, \sigma^2)$ is not differentiable.
-We rewrite it as:
-
-$$
-z = \mu + \sigma\,\varepsilon, \qquad \varepsilon \sim \mathcal{N}(0, I)
-$$
-
-Gradients flow through $\mu$ and $\sigma$ but not through the stochastic
-$\varepsilon$.
+[![CI](https://github.com/aipher-group/pyvae/actions/workflows/ci.yml/badge.svg)](https://github.com/aipher-group/pyvae/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
 
-## 2  Setup
+## Why an *informed* VAE?
 
-This project uses [pixi](https://prefix.dev/) for environment management.
+A standard Variational Autoencoder learns a compressed latent representation
+$z$ of the input $x$ by maximising the Evidence Lower Bound (ELBO):
+
+$$
+\text{ELBO} = \mathbb{E}_{q(z|x)}[\log p(x|z)] - \text{KL}(q(z|x)\,\|\,p(z))
+$$
+
+Gene expression is high-dimensional (~20 000 genes) but structured: genes act
+together in *pathways*. `pyvae` restricts the encoder's first layer so only the
+gene → pathway connections that exist in Reactome are allowed, enforced with a
+binary mask on the weight matrix, $W_{\text{eff}} = W \odot M$, where
+$M_{ji}=1$ iff gene $i$ belongs to pathway $j$. This reduces parameters, injects
+prior biological knowledge, and makes each latent node interpretable as a
+pathway.
+
+## Features
+
+- `InformedLinear` — a masked linear layer enforcing arbitrary connectivity priors.
+- `InformedVAE` — the full encoder/decoder with the reparameterisation trick and
+  a combined reconstruction + KL + L2 loss.
+- `train_ivae` — a training loop with gradient clipping and early stopping.
+- Reactome helpers (`build_model_config`, `sync_gexp_adj`) and a Kang PBMC
+  dataset loader (`load_kang`) for end-to-end pipelines.
+
+## Installation
 
 ```bash
-# Install all dependencies (creates a local .pixi/ env)
-pixi install
-
-# Activate the environment
-pixi shell
+pip install pyvae                      # from PyPI
+conda install -c conda-forge pyvae     # from conda-forge (after feedstock merge)
+pixi add pyvae                         # into a pixi project
 ```
 
-All further commands assume you are inside `pixi shell`.
+`pyvae` is a pure-Python, `noarch` package and runs on Linux, macOS, and Windows.
 
----
+### GPU acceleration
 
-## 3  Implementation steps
+`pyvae` only requires `torch>=2.3,<3` and never pins a platform, so which
+hardware you can accelerate depends entirely on which PyTorch build your install
+command pulls. Use this table to pick the right path:
 
-Work through the files in this order - each one builds on the previous.
+| Your machine | `pip install pyvae` | `conda install -c conda-forge pyvae` | Accelerated out of the box? |
+|---|---|---|---|
+| **NVIDIA CUDA (Linux/Windows)** | default `torch` wheel is the CUDA build | conda-forge ships CUDA `pytorch` variants | ✅ yes, on both |
+| **Apple Silicon (macOS arm64)** | standard wheel includes **MPS** (Metal) | conda-forge osx-arm64 build includes MPS | ✅ yes — use `device="mps"` |
+| **AMD ROCm (Linux)** | gets the CUDA wheel, which won't drive an AMD GPU | conda-forge has **no ROCm** builds → CPU only | ❌ no — see ROCm steps below |
+| **Intel macOS / generic CPU** | CPU wheel | CPU build | n/a — CPU only |
 
-### Step 1 - `pyvae/utils.py`
+**CUDA and Apple-Silicon users need no extra steps.** Verify at runtime with
+`python -c "import torch; print(torch.cuda.is_available())"` (CUDA) or
+`torch.backends.mps.is_available()` (macOS).
 
-Implement `set_all_seeds(seed)`.  Set the seed for `random`, `numpy`,
-`torch`, and (if available) `torch.cuda`.
-
-### Step 2 - `pyvae/layers.py`
-
-Implement `InformedLinear.__init__` and `InformedLinear.forward`.
-
-Key points:
-- Initialise `self.weight` with Xavier uniform (`nn.init.xavier_uniform_`).
-- Register `adj.T` as a non-trainable buffer called `"mask"`.
-- Register a `"bias_mask"` that is 1 for pathways with >= 1 gene input.
-- In `forward`, apply $W_{\text{eff}} = W \odot M$ before the linear transform.
-
-### Step 3 - `pyvae/models.py`
-
-Implement the six methods of `InformedVAE`:
-
-| Method | What to do |
-|---|---|
-| `__init__` | Create the five layers listed in the docstring |
-| `encode` | genes -> pathways -> $(\mu,\, \log\sigma^2,\, h)$ |
-| `reparameterise` | sample $z = \mu + \sigma\varepsilon$ via the reparameterisation trick |
-| `decode` | $z$ -> pathways (tanh) -> genes (linear, no activation) |
-| `forward` | chain encode -> reparameterise -> decode |
-| `loss` | $\mathcal{L}_{\text{recon}} + \mathcal{L}_{\text{KL}} + \mathcal{L}_{L2}$ (see docstring) |
-
-### Step 4 - `pyvae/train.py`
-
-Implement `train_ivae`.  Follow the algorithm description in the docstring.
-Pay attention to:
-- gradient clipping after each backward pass,
-- early stopping: reset the patience counter only when `val_loss` improves.
-
-### Step 5 - `pyvae/datasets.py`  *(optional)*
-
-Implement `load_kang` to download and preprocess the Kang PBMC dataset.
-Only needed if you want to run the full pipeline on real data.
-
-### Step 6 - `pyvae/bio.py`  *(optional)*
-
-Implement the four helpers (`get_reactome_adj`, `get_reactome_hierarchical_adj`,
-`sync_gexp_adj`, `build_model_config`) to load Reactome pathway data and build
-the adjacency matrix.  Only needed for the full pipeline.
-
----
-
-## 4  Testing your implementation
-
-Use `pixi run pytest` instead of calling `pytest` directly.  `pixi run`
-executes the command inside the managed environment, so it always picks up
-the correct Python interpreter and installed packages — even if you have
-other Python versions on your system or forgot to activate `pixi shell`.
+**AMD ROCm users must install torch from PyTorch's ROCm index** — ROCm wheels
+exist neither on PyPI nor on conda-forge, so `conda install` is a dead end for
+AMD GPUs. Install ROCm torch *first*, then pyvae (pip then sees the constraint
+already satisfied and leaves torch alone):
 
 ```bash
-# Run all contract tests (do this after every module you implement)
-pixi run pytest tests/ -v
-
-# Run a single test file
-pixi run pytest tests/contract/test_ivae_contract.py -v
-
-# Stop on first failure (useful while debugging one function at a time)
-pixi run pytest tests/ -x
+pip install torch torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/rocm7.2   # match your ROCm runtime
+pip install pyvae
 ```
 
-**When to run tests:**
-- Before you write anything: all three implementation tests should raise
-  `NotImplementedError` — this confirms the skeleton is intact.
-- After each step: run the full suite to check you have not broken anything
-  you already implemented.
-- After Step 2 (`layers.py`): `test_informed_linear_mask_behavior` should pass.
-- After Step 3 (`models.py`): `test_model_forward_and_loss_shapes` should pass.
-- After Step 4 (`train.py`): `test_train_returns_history_lists` should pass.
+To pin an explicit CUDA stack via conda instead of relying on auto-detection:
 
-The test suite (`tests/contract/test_ivae_contract.py`) checks:
+```bash
+conda create -n pyvae-cuda12 -c conda-forge -c pytorch -c nvidia \
+  pyvae pytorch pytorch-cuda=12.*
+```
 
-| Test | What it verifies |
-|---|---|
-| `test_public_api_exists` | All public names are importable |
-| `test_train_signature_contract` | `train_ivae` has the exact 8 expected parameters |
-| `test_informed_linear_mask_behavior` | Masked weights produce correct outputs |
-| `test_model_forward_and_loss_shapes` | Forward pass shapes; loss is a finite positive scalar |
-| `test_train_returns_history_lists` | Training runs and returns matching train/val history |
+Match the CUDA/ROCm version to your driver/runtime; the official
+[PyTorch selector](https://pytorch.org/get-started/locally/) gives exact wheels.
 
-The first two tests (`test_public_api_exists`, `test_train_signature_contract`)
-pass immediately without any implementation — they only check that the
-API structure is correct.  The remaining three require working code.
-
----
-
-## 5  Full pipeline example
-
-Once all steps are implemented:
+## Quickstart
 
 ```python
 import pandas as pd
 import torch
 import pyvae
 
-# 1. Load and preprocess data
+# 1. Load and preprocess data (Kang PBMC)
 adata = pyvae.load_kang(data_folder="./data", n_genes=3000)
 
-# 2. Split into train / validation
+# 2. Train/validation split
 train_mask = adata.obs["split"] == "train"
 x_train = pd.DataFrame(adata[train_mask].X.toarray(), columns=adata.var_names)
 x_val   = pd.DataFrame(adata[~train_mask].X.toarray(), columns=adata.var_names)
 
-# 3. Build biological configuration
+# 3. Build the biological (Reactome) configuration and adjacency
 config = pyvae.build_model_config(
     genes=x_train.columns,
     model_kind="ivae_reactome_hierarchical_d2",
     resources_dir="./resources",
 )
-
-# 4. Create adjacency tensor
 adj = torch.tensor(config.model_layer[0].values, dtype=torch.float32)
 
-# 5. Initialise model
+# 4. Build and train the model
 model = pyvae.InformedVAE(adj=adj, latent_dim=64, l2_lambda=1e-5)
-
-# 6. Train
 model, history = pyvae.train_ivae(
     model, x_train, x_val,
-    epochs=500, batch_size=32, patience=50,
-    lr=1e-4, device="cpu",
+    epochs=500, batch_size=32, patience=50, lr=1e-4, device="cpu",
 )
 
-# 7. Encode new cells
-x_tensor = torch.tensor(x_val.values, dtype=torch.float32)
-z_mean, z_log_var, h = model.encode(x_tensor)
-# z_mean : latent representations  (n_cells, latent_dim)
-# h      : pathway activations     (n_cells, n_pathways) - biologically interpretable
+# 5. Encode new cells — `h` is the interpretable pathway activation
+z_mean, z_log_var, h = model.encode(torch.tensor(x_val.values, dtype=torch.float32))
 ```
 
----
+## Development
 
-## 6  Tips
+This repo is managed with [pixi](https://pixi.sh). The manifest defines several
+environments (`default`, `ci`, `cuda12`, `rocm72`, `publish`):
 
-- **Numerical stability**: always clamp `log_var` to $[-3, 3]$ before calling
-  `exp`.  Unclamped log-variance can produce `NaN` in the very first epoch.
-- **Gradient clipping**: the reconstruction loss is scaled by $n_{\text{genes}}$
-  (~3 000), which can create large gradients early in training.
-- **Loss scale**: it is normal for the total loss to start in the thousands
-  and decrease over hundreds of epochs.  Do not worry if it looks large.
-- **Variance scaling**: scaling $\sigma$ by a factor less than 1 keeps the
-  initial KL term small, letting the model focus on reconstruction first.
-- **Device mismatch**: make sure both the model and the input tensors are on
-  the same device (`.to(device)`) before calling `forward` or `loss`.
+```bash
+pixi install              # create the default environment
+pixi run pytest tests/ -v # run the test suite
+pixi run fixcode          # ruff lint + import sort
+pixi run formatcode       # ruff format
+```
 
----
+Without pixi, a standard editable install works too:
 
-## 7  Project structure
+```bash
+pip install -e ".[dev]" && pytest tests/ -v
+```
+
+## Releasing
+
+Both distribution channels are wired up. Bump the version in `pyproject.toml`
+(`[project].version` **and** `[tool.pixi.package].version`) before releasing.
+
+**PyPI** (Trusted Publishing in CI on a `v*` tag, or locally via the isolated
+`publish` env):
+
+```bash
+pixi run -e publish build-dist     # build sdist + wheel into dist/
+pixi run -e publish check-dist     # twine metadata check
+pixi run -e publish publish-pypi   # upload (set TWINE_REPOSITORY=testpypi for TestPyPI)
+```
+
+**conda** — built as a single `noarch` package by pixi:
+
+```bash
+pixi publish --target-dir ./conda-dist          # build + copy locally (no upload)
+pixi publish --to https://prefix.dev/<channel>  # or push to a channel directly
+```
+
+Distribution through **conda-forge** is handled by a feedstock rather than a
+direct upload. A ready-to-submit recipe and step-by-step instructions live in
+[`conda-recipe/`](conda-recipe/). On a tagged release, `.github/workflows/release.yml`
+builds and verifies both artifacts and attaches the `noarch` conda package to
+the GitHub Release.
+
+## Project layout
 
 ```
 pyvae/
-├── __init__.py      public API (do not modify)
-├── utils.py         Step 1 - seed utilities
-├── layers.py        Step 2 - InformedLinear
-├── models.py        Step 3 - InformedVAE
-├── train.py         Step 4 - training loop
-├── datasets.py      Step 5 - Kang dataset loader
-└── bio.py           Step 6 - Reactome adjacency helpers
-
-tests/
-└── contract/
-    └── test_ivae_contract.py   <- run these to check your work
+├── __init__.py    public API
+├── utils.py       seeding utilities
+├── layers.py      InformedLinear (masked layer)
+├── models.py      InformedVAE
+├── train.py       training loop
+├── datasets.py    Kang dataset loader
+└── bio.py         Reactome adjacency helpers
+tests/             contract tests
+conda-recipe/      conda-forge recipe + submission guide
 ```
+
+## Acknowledgements
+
+`pyvae` is a PyTorch reimplementation that builds on earlier Keras informed-VAE
+work directed by Carlos Loucera:
+
+- Pelin Gundogdu — [babelomics/ivae_scorer](https://github.com/babelomics/ivae_scorer)
+- Alberto Esteban-Medina — [albertoem77/robustness_informed_TFM](https://github.com/albertoem77/robustness_informed_TFM)
+- Sara Fernandez — [saraafdezz/robustness_informed_TFG](https://github.com/saraafdezz/robustness_informed_TFG)
+
+## License
+
+[MIT](LICENSE) © Amir Aynede, Carlos Loucera
