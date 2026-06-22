@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+jobs:
+  tests:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+
+      - name: Run contract tests
+        run: python -m pytest tests/ -v
+
+  package-check:
+    name: Package checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m build
+
+      - name: Check package metadata
+        run: python -m twine check dist/*
+
+  gpu-smoke:
+    name: Linux smoke (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cpu, cuda12]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+
+      - name: Install CUDA wheel variant
+        if: matrix.variant == 'cuda12'
+        run: |
+          python -m pip install --upgrade --force-reinstall \
+            torch torchvision torchaudio \
+            --index-url https://download.pytorch.org/whl/cu124
+
+      - name: Smoke import
+        run: python -c "import pyvae; print('import ok')"
+
+  rocm-dry-run:
+    name: ROCm dry run (container, no GPU)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    container:
+      image: rocm/dev-ubuntu-22.04:6.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Python tooling
+        run: |
+          apt-get update
+          apt-get install -y python3 python3-pip
+
+      - name: Install ROCm PyTorch wheel
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install \
+            torch torchvision torchaudio \
+            --index-url https://download.pytorch.org/whl/rocm6.1
+
+      - name: Install package
+        run: python3 -m pip install .
+
+      - name: Verify imports
+        run: |
+          python3 -c "import torch; print('Torch:', torch.__version__)"
+          python3 -c "import pyvae; print('pyvae import ok')"
