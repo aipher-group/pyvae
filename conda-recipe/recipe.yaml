@@ -9,10 +9,9 @@ package:
   version: ${{ version }}
 
 source:
-  # Built from the PyPI sdist; fill in the sha256 after the 0.0.1 PyPI release
-  # (see README.md). conda-forge does not build from git for releases.
+  # Built from the PyPI sdist (conda-forge does not build from git for releases).
   url: https://pypi.org/packages/source/${{ name[0] }}/${{ name }}/${{ name }}-${{ version }}.tar.gz
-  sha256: 0000000000000000000000000000000000000000000000000000000000000000
+  sha256: 669823ba13d8097689a65adc8bbf30cfdafe384254f7e3800ad51e41aa5d1fac
 
 build:
   noarch: python
@@ -54,5 +53,4 @@ about:
 
 extra:
   recipe-maintainers:
-    # TODO: confirm the GitHub handle(s) that will maintain the feedstock.
-    - cloucera
+    - loucerac
