@@ -33,12 +33,11 @@ class InformedVAE(nn.Module):
     def encode(self, x: torch.Tensor):
         h = self.informed(x)
         mu = self.fc_mean(h)
-        log_var = self.fc_log_var(h)
+        log_var = torch.clamp(self.fc_log_var(h), -3, 3)
         return mu, log_var, h
 
     def reparameterise(self, mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
-        clamped = torch.clamp(log_var, -3, 3)
-        sigma = torch.exp(0.5 * clamped) * 0.01
+        sigma = torch.exp(0.5 * log_var)
         eps = torch.randn_like(sigma)
         return mu + sigma * eps
 
