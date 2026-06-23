@@ -11,6 +11,8 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+conda-dist/
+*.conda
 downloads/
 eggs/
 .eggs/
@@ -216,3 +218,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+.DS_Store
+**/.DS_Store
