@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -29,6 +31,7 @@ def train_ivae(
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-7)
     history = {"train": [], "val": []}
     best_val_loss = float("inf")
+    best_state = None
     patience_counter = 0
 
     from tqdm.auto import tqdm
@@ -64,9 +67,12 @@ def train_ivae(
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
+            best_state = copy.deepcopy(model.state_dict())
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 break
 
+    if best_state is not None:
+        model.load_state_dict(best_state)
     return model, history
