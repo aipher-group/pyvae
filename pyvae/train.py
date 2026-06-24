@@ -24,8 +24,13 @@ def train_ivae(
     x_train_tensor = torch.tensor(x_train.values, dtype=torch.float32)
     x_val_tensor = torch.tensor(x_val.values, dtype=torch.float32)
 
+    generator = torch.Generator()
+    generator.manual_seed(torch.initial_seed())
+
     train_dataset = TensorDataset(x_train_tensor)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, generator=generator
+    )
 
     x_val_tensor = x_val_tensor.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-7)
