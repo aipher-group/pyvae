@@ -170,7 +170,7 @@ def build_model_config(
         Uses the full Reactome GMT file at resources_dir.
         Call get_reactome_adj then sync_gexp_adj.
 
-    Both branches return an InformedModelConfig with n_encoding_layers=2.
+    Both branches return an InformedModelConfig with n_encoding_layers=1.
 
     Parameters
     ----------
@@ -210,7 +210,7 @@ def build_model_config(
         return InformedModelConfig(
             model_kind=model_kind,
             frac=frac if frac is not None else 0.0,
-            n_encoding_layers=2,
+            n_encoding_layers=1,
             adj_name=["d2_pathways"],
             adj_activ=["tanh"],
             input_genes=input_genes,
@@ -230,7 +230,7 @@ def build_model_config(
         return InformedModelConfig(
             model_kind=model_kind,
             frac=frac if frac is not None else 0.0,
-            n_encoding_layers=2,
+            n_encoding_layers=1,
             adj_name=["pathways"],
             adj_activ=["tanh"],
             input_genes=input_genes,
