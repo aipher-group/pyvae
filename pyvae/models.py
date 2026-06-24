@@ -12,6 +12,7 @@ class InformedVAE(nn.Module):
         latent_dim: int | None = None,
         seed: int = 42,
         l2_lambda: float = 1e-5,
+        beta: float = 1.0,
     ):
 
         super().__init__()
@@ -23,6 +24,7 @@ class InformedVAE(nn.Module):
         self.n_pathways = n_pathways
         self.latent_dim = latent_dim if latent_dim is not None else n_pathways // 2
         self.l2_lambda = l2_lambda
+        self.beta = beta
 
         self.informed = InformedLinear(adj, activation="tanh")
         self.fc_mean = nn.Linear(self.n_pathways, self.latent_dim)
@@ -63,7 +65,7 @@ class InformedVAE(nn.Module):
         h: torch.Tensor,
     ) -> torch.Tensor:
 
-        recon_loss = F.mse_loss(recon, x) * self.n_genes
-        kl_loss = -0.5 * torch.mean(1 + log_var - mu**2 - torch.exp(log_var))
-        l2_loss = self.l2_lambda * torch.mean(h**2)
-        return recon_loss + kl_loss + l2_loss
+        recon_loss = F.mse_loss(recon, x, reduction="none").sum(dim=1).mean()
+        kl_loss = -0.5 * (1 + log_var - mu**2 - torch.exp(log_var)).sum(dim=1).mean()
+        l2_loss = self.l2_lambda * (h**2).sum(dim=1).mean()
+        return recon_loss + self.beta * kl_loss + l2_loss
