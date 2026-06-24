@@ -10669,6 +10669,7 @@ packages:
   - numpy>=1.26,<3
   - pandas>=2.0,<3
   - scanpy>=1.11,<2
+  - scikit-misc>=0.3
   - tqdm>=4.66,<5
   - pytest>=9.0,<10 ; extra == 'dev'
   - build>=1.2 ; extra == 'dev'
