@@ -177,7 +177,7 @@ torchaudio = ">=2.4,<3"
 
 [tool.pixi.environments]
 default = { features = ["cpu", "dev", "notebook"], solve-group = "torch" }
-ci     = { features = ["cpu", "dev"], solve-group = "torch" }
+ci     = { features = ["cpu", "dev"] }
 cuda12 = { features = ["cuda12", "dev", "notebook"], solve-group = "torch" }
 rocm72 = { features = ["rocm72", "dev", "notebook"], solve-group = "rocm" }
 # Minimal env for building/uploading the PyPI artifacts; no torch stack pulled in.
