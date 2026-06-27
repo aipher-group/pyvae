@@ -1,11 +1,11 @@
 name: CI
 
-# Run only for develop: direct pushes to develop and PRs targeting develop.
+# Run on develop pushes, and on PRs targeting develop or main (release PRs).
 on:
   push:
     branches: [develop]
   pull_request:
-    branches: [develop]
+    branches: [develop, main]
 
 concurrency:
   group: ci-${{ github.ref }}
