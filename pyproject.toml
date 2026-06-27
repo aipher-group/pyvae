@@ -54,7 +54,7 @@ name = "pyvae"
 version = "0.1.1"
 authors = ["Amir Aynede <amiraynede@gmail.com>", "Carlos Loucera <clou@us.es>"]
 channels = ["conda-forge", "pytorch", "nvidia"]
-platforms = ["osx-arm64", "linux-64"]
+platforms = ["osx-arm64", "linux-64", "win-64"]
 # `pixi-build` enables `pixi build` / `pixi publish` for the conda package
 # defined in `[tool.pixi.package]` below. pyvae is pure Python, so the package
 # is built `noarch` and installs on every platform from a single build.
