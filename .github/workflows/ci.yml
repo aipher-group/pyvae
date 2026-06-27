@@ -25,6 +25,10 @@ jobs:
       - uses: prefix-dev/setup-pixi@v0.9.6
         with:
           environments: ci      # lean cpu + dev env from pyproject.toml
+          # --frozen (not --locked): the pixi-build workspace-as-package makes the
+          # strict --locked freshness check always fail; --frozen uses the
+          # committed lock as-is.
+          frozen: true
           cache: true
       - run: pixi run -e ci pytest tests/ -v
 
@@ -47,5 +51,6 @@ jobs:
       - uses: prefix-dev/setup-pixi@v0.9.6
         with:
           environments: ${{ matrix.env }}
+          frozen: true
           cache: true
       - run: pixi run -e ${{ matrix.env }} python -c "import torch, pyvae; print('torch', torch.__version__, '| pyvae import ok')"
