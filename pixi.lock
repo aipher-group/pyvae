@@ -126,7 +126,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/ruff-0.15.20-h6a952e8_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/s2n-1.7.4-h92489ea_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/scikit-learn-1.9.0-np2py313h16d504d_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/scikit-misc-0.5.2-py313h9cc49e9_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/scipy-1.18.0-py313h4b8bb8b_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/sleef-3.9.0-ha0421bc_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/statsmodels-0.14.6-py313h29aa505_0.conda
@@ -397,7 +396,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/readline-8.3-h46df422_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/ruff-0.15.20-h80928e0_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/scikit-learn-1.9.0-np2py313h3b23316_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/osx-arm64/scikit-misc-0.5.2-py313h67fd93b_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/scipy-1.18.0-py313h52f5312_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/sleef-3.9.0-hb028509_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/statsmodels-0.14.6-py313hc577518_0.conda
@@ -618,7 +616,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/ruff-0.15.20-h6a952e8_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/s2n-1.7.4-h92489ea_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/scikit-learn-1.9.0-np2py313h16d504d_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/scikit-misc-0.5.2-py313h9cc49e9_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/scipy-1.18.0-py313h4b8bb8b_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/sleef-3.9.0-ha0421bc_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/statsmodels-0.14.6-py313h29aa505_0.conda
@@ -1001,7 +998,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/ruff-0.15.20-h6a952e8_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/s2n-1.7.4-h92489ea_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/scikit-learn-1.9.0-np2py313h16d504d_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/scikit-misc-0.5.2-py313h9cc49e9_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/scipy-1.18.0-py313h4b8bb8b_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/sleef-3.9.0-ha0421bc_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/statsmodels-0.14.6-py313h29aa505_0.conda
@@ -1488,7 +1484,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/rpds-py-2026.5.1-py313hb9d2816_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/ruff-0.15.20-h80928e0_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/scikit-learn-1.9.0-np2py313h3b23316_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/osx-arm64/scikit-misc-0.5.2-py313h67fd93b_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/scipy-1.18.0-py313h52f5312_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/sleef-3.9.0-hb028509_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/statsmodels-0.14.6-py313hc577518_0.conda
@@ -1823,7 +1818,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/ruff-0.15.20-h6a952e8_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/s2n-1.7.4-h92489ea_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/scikit-learn-1.9.0-np2py313h16d504d_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/scikit-misc-0.5.2-py313h9cc49e9_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/scipy-1.18.0-py313h4b8bb8b_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/statsmodels-0.14.6-py313h29aa505_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/tk-8.6.13-noxft_h366c992_103.conda
@@ -5353,24 +5347,6 @@ packages:
   run_exports: {}
   size: 10208137
   timestamp: 1780401055093
-- conda: https://conda.anaconda.org/conda-forge/linux-64/scikit-misc-0.5.2-py313h9cc49e9_0.conda
-  sha256: 865a6fe4399df530b32a8ba24f5884f5db47504e896d6cbd1004b44e7e649c70
-  md5: be1490c6fa248a59c1fea584d369d889
-  depends:
-  - __glibc >=2.17,<3.0.a0
-  - libgcc >=14
-  - libgfortran
-  - libgfortran5 >=14.3.0
-  - numpy >=1.23,<3
-  - python >=3.13,<3.14.0a0
-  - python_abi 3.13.* *_cp313
-  license: BSD-3-Clause
-  license_family: BSD
-  purls:
-  - pkg:pypi/scikit-misc?source=hash-mapping
-  run_exports: {}
-  size: 164867
-  timestamp: 1765556541047
 - conda: https://conda.anaconda.org/conda-forge/linux-64/scipy-1.18.0-py313h4b8bb8b_0.conda
   sha256: 3ffdca726208a7394b2aa9989e5b1718e28a6285329bbc10bea4e92066e14f49
   md5: a32f88181ff9a3451c71be1f17a7c799
@@ -10652,24 +10628,6 @@ packages:
   run_exports: {}
   size: 9578596
   timestamp: 1780401265477
-- conda: https://conda.anaconda.org/conda-forge/osx-arm64/scikit-misc-0.5.2-py313h67fd93b_0.conda
-  sha256: 4d1d6ef4ea6c48142a2d20fb37ceb43d2bd34d50fc72ee3b322c0e6364493df5
-  md5: 01e3a784bafeb5e28bcb9fb922721666
-  depends:
-  - __osx >=11.0
-  - libgfortran
-  - libgfortran5 >=14.3.0
-  - numpy >=1.23,<3
-  - python >=3.13,<3.14.0a0
-  - python >=3.13,<3.14.0a0 *_cp313
-  - python_abi 3.13.* *_cp313
-  license: BSD-3-Clause
-  license_family: BSD
-  purls:
-  - pkg:pypi/scikit-misc?source=hash-mapping
-  run_exports: {}
-  size: 145575
-  timestamp: 1765556857620
 - conda: https://conda.anaconda.org/conda-forge/osx-arm64/scipy-1.18.0-py313h52f5312_0.conda
   sha256: d1bf4f384b822df098eddf66ac71e407c63148b1fb3b5cf4d536f6ae40269cca
   md5: 110ff05ffef908af95192bb17c4006a0
@@ -10881,7 +10839,6 @@ packages:
   - numpy>=1.26,<3
   - pandas>=2.0,<3
   - scanpy>=1.11,<2
-  - scikit-misc>=0.3
   - tqdm>=4.66,<5
   - pytest>=9.0,<10 ; extra == 'dev'
   - build>=1.2 ; extra == 'dev'

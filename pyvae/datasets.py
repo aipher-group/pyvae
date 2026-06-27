@@ -27,7 +27,8 @@ def load_kang(data_folder=".", normalize=True, n_genes=None, return_path=False):
     5. If normalize is True: apply library-size normalisation followed
        by log1p.
     6. If n_genes is set: select the top n highly-variable genes using
-       the seurat_v3 flavour on the raw count layer, then subset adata.
+       scanpy's dispersion-based seurat flavour on the (log-normalised)
+       expression matrix, then subset adata. Best used with normalize=True.
     7. Write the processed object to disk and return it (or its path).
 
     Parameters
@@ -76,12 +77,10 @@ def load_kang(data_folder=".", normalize=True, n_genes=None, return_path=False):
         sc.pp.log1p(adata)
 
     if n_genes is not None:
-        sc.pp.highly_variable_genes(
-            adata,
-            n_top_genes=n_genes,
-            flavor="seurat_v3",
-            layer="counts",
-        )
+        # Dispersion-based `seurat` flavour (the scanpy default) on the
+        # log-normalised matrix. Same intent as `seurat_v3` (keep the top
+        # n_genes most variable genes) but pure numpy/scipy — no scikit-misc.
+        sc.pp.highly_variable_genes(adata, n_top_genes=n_genes)
         adata = adata[:, adata.var["highly_variable"]].copy()
 
     adata.write_h5ad(out_path)
