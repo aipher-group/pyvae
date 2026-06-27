@@ -24,12 +24,20 @@ Link the issue in the PR (e.g. "Closes #2"). Keep PRs focused and atomic.
 
 ## Releasing (maintainers)
 
+Publishing runs **only** when a **GitHub Release** with a `v*` tag is published
+and that tag's commit is on `main`. A bare `git push origin vX.Y.Z` does **not**
+publish.
+
 ```bash
+# 1. bump the version in pyproject.toml ([project] + [tool.pixi.*]) on develop, then:
 gh pr create --base main --head develop --title "Release vX.Y.Z"
-# after merge:
-git tag vX.Y.Z   # bump version in pyproject.toml first
-git push origin vX.Y.Z          # release.yml builds + publishes to PyPI and conda
+
+# 2. after the PR merges, cut the release FROM main (creates the tag + triggers release.yml):
+gh release create vX.Y.Z --target main --title "vX.Y.Z" --generate-notes
 ```
+
+`release.yml` then builds + publishes to PyPI and builds the conda package. The
+release is refused if the tag isn't `v*` or its commit isn't on `main`.
 
 ## Local setup
 

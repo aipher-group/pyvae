@@ -1,9 +1,9 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  # Publishing happens ONLY when a GitHub Release is published. A bare v* tag
+  # push does not release — you must cut a Release. The `guard` job below further
+  # enforces the tag is `v*` and its commit lives on `main`.
   release:
     types: [published]
 
@@ -12,8 +12,36 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  guard:
+    name: Verify v* tag on main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tag must be v* and its commit must be on main
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          echo "Release tag: $TAG  commit: $GITHUB_SHA"
+          case "$TAG" in
+            v*) ;;
+            *) echo "::error::Release tag '$TAG' is not a v* tag — refusing to publish."; exit 1 ;;
+          esac
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "OK: commit $GITHUB_SHA is contained in main."
+          else
+            echo "::error::Release commit $GITHUB_SHA is not on main — refusing to publish."
+            exit 1
+          fi
+
   build:
     name: Build artifacts
+    needs: guard
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -39,6 +67,7 @@ jobs:
 
   build-conda:
     name: Build conda package (noarch)
+    needs: guard
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
