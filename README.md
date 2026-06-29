@@ -11,7 +11,7 @@ features.
 [![CI](https://github.com/aipher-group/pyvae/actions/workflows/ci.yml/badge.svg)](https://github.com/aipher-group/pyvae/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![conda-forge](https://img.shields.io/conda/vn/conda-forge/pyvae.svg)](https://anaconda.org/conda-forge/pyvae)
-![PyPI Version](https://img.shields.io/pypi/v/pyvae)
+[![PyPI Version](https://img.shields.io/pypi/v/pyvae)](https://pypi.org/project/pyvae/)
 
 
 ---
