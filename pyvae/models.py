@@ -1,8 +1,13 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from pyvae.layers import InformedLinear
+from pyvae.components import (
+    DenseDecoder,
+    Encoder,
+    GaussianLikelihood,
+    gaussian_kl,
+    reparameterise,
+)
 
 
 class InformedVAE(nn.Module):
@@ -14,7 +19,6 @@ class InformedVAE(nn.Module):
         l2_lambda: float = 1e-5,
         beta: float = 1.0,
     ):
-
         super().__init__()
         torch.manual_seed(seed)
 
@@ -26,31 +30,24 @@ class InformedVAE(nn.Module):
         self.l2_lambda = l2_lambda
         self.beta = beta
 
-        self.informed = InformedLinear(adj, activation="tanh")
-        self.fc_mean = nn.Linear(self.n_pathways, self.latent_dim)
-        self.fc_log_var = nn.Linear(self.n_pathways, self.latent_dim)
-        self.dec_latent = nn.Linear(self.latent_dim, self.n_pathways)
-        self.dec_out = nn.Linear(self.n_pathways, self.n_genes)
+        self.encoder = Encoder(adj=adj, latent_dim=self.latent_dim)
+        self.decoder = DenseDecoder(
+            latent_dim=self.latent_dim,
+            n_pathways=self.n_pathways,
+            n_genes=self.n_genes,
+        )
+        self.likelihood = GaussianLikelihood()
 
     def encode(self, x: torch.Tensor):
-        h = self.informed(x)
-        mu = self.fc_mean(h)
-        log_var = torch.clamp(self.fc_log_var(h), -3, 3)
-        return mu, log_var, h
+        return self.encoder(x)
 
     def reparameterise(self, mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
-        sigma = torch.exp(0.5 * log_var)
-        eps = torch.randn_like(sigma)
-        return mu + sigma * eps
+        return reparameterise(mu, log_var)
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-
-        h_prime = torch.tanh(self.dec_latent(z))
-        x_hat = self.dec_out(h_prime)
-        return x_hat
+        return self.decoder(z)
 
     def forward(self, x: torch.Tensor):
-
         mu, log_var, h = self.encode(x)
         z = self.reparameterise(mu, log_var)
         recon = self.decode(z)
@@ -64,8 +61,7 @@ class InformedVAE(nn.Module):
         log_var: torch.Tensor,
         h: torch.Tensor,
     ) -> torch.Tensor:
-
-        recon_loss = F.mse_loss(recon, x, reduction="none").sum(dim=1).mean()
-        kl_loss = -0.5 * (1 + log_var - mu**2 - torch.exp(log_var)).sum(dim=1).mean()
+        recon_loss = self.likelihood(recon, x)
+        kl_loss = gaussian_kl(mu, log_var)
         l2_loss = self.l2_lambda * (h**2).sum(dim=1).mean()
         return recon_loss + self.beta * kl_loss + l2_loss
