@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from pyvae.layers import InformedLinear
 
@@ -37,7 +38,9 @@ def reparameterise(mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
     -------
     z : (batch, latent) sampled latent, differentiable wrt mu and log_var.
     """
-    raise NotImplementedError
+    sigma = torch.exp(0.5 * log_var)
+    eps = torch.randn_like(sigma)
+    return mu + sigma * eps
 
 
 def gaussian_kl(mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
@@ -55,7 +58,7 @@ def gaussian_kl(mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
     -------
     kl : scalar tensor (0-dim).
     """
-    raise NotImplementedError
+    return -0.5 * (1 + log_var - mu**2 - torch.exp(log_var)).sum(dim=1).mean()
 
 
 class Encoder(nn.Module):
@@ -73,12 +76,14 @@ class Encoder(nn.Module):
 
     def __init__(self, adj: torch.Tensor, latent_dim: int):
         super().__init__()
-        # self.informed = InformedLinear(adj, activation="tanh")
-        # self.fc_mean = nn.Linear(n_pathways, latent_dim)
-        # self.fc_log_var = nn.Linear(n_pathways, latent_dim)
-        raise NotImplementedError
+        n_pathways = adj.shape[1]
+        self.informed = InformedLinear(adj, activation="tanh")
+        self.fc_mean = nn.Linear(n_pathways, latent_dim)
+        self.fc_log_var = nn.Linear(n_pathways, latent_dim)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Encode a batch of expression.
 
         Parameters
@@ -92,7 +97,10 @@ class Encoder(nn.Module):
         h : (batch, n_pathways) pathway activations (used by the L2 term and
             for interpretation).
         """
-        raise NotImplementedError
+        h = self.informed(x)
+        mu = self.fc_mean(h)
+        log_var = torch.clamp(self.fc_log_var(h), -3, 3)
+        return mu, log_var, h
 
 
 class DenseDecoder(nn.Module):
@@ -109,9 +117,8 @@ class DenseDecoder(nn.Module):
 
     def __init__(self, latent_dim: int, n_pathways: int, n_genes: int):
         super().__init__()
-        # self.dec_latent = nn.Linear(latent_dim, n_pathways)
-        # self.dec_out = nn.Linear(n_pathways, n_genes)
-        raise NotImplementedError
+        self.dec_latent = nn.Linear(latent_dim, n_pathways)
+        self.dec_out = nn.Linear(n_pathways, n_genes)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """Decode latent samples back to gene space.
@@ -124,7 +131,10 @@ class DenseDecoder(nn.Module):
         -------
         recon : (batch, n_genes) reconstructed expression.
         """
-        raise NotImplementedError
+
+        h_prime = torch.tanh(self.dec_latent(z))
+        x_hat = self.dec_out(h_prime)
+        return x_hat
 
 
 class GaussianLikelihood(nn.Module):
@@ -149,4 +159,4 @@ class GaussianLikelihood(nn.Module):
         -------
         loss : scalar tensor (0-dim), summed over genes, mean over batch.
         """
-        raise NotImplementedError
+        return F.mse_loss(recon, x, reduction="none").sum(dim=1).mean()
