@@ -67,9 +67,9 @@ def train_ivae(
             for (x_batch,) in val_loader:
                 x_batch = x_batch.to(device)
                 recon, mu, log_var, h = model(x_batch)
-                val_loss_sum += model.loss(
-                    x_batch, recon, mu, log_var, h
-                ).item() * len(x_batch)
+                val_loss_sum += model.loss(x_batch, recon, mu, log_var, h).item() * len(
+                    x_batch
+                )
         val_loss = val_loss_sum / len(x_val_tensor)
 
         history["train"].append(avg_train_loss)
