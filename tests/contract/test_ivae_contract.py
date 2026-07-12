@@ -18,6 +18,8 @@ def test_train_signature_contract():
         "model",
         "x_train",
         "x_val",
+        "x_counts_train",
+        "x_counts_val",
         "epochs",
         "batch_size",
         "patience",
