@@ -80,6 +80,7 @@ class InformedVAE(nn.Module):
         counts: torch.Tensor | None = None,
         library: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """x is ignored when likelihood_kind == "nb"; counts/library are used instead."""
         if self.likelihood_kind == "gaussian":
             recon_loss = self.likelihood(recon, x)
         else:  # nb
