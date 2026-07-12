@@ -2,10 +2,12 @@ import torch
 import torch.nn as nn
 
 from pyvae.components import (
+    CountDecoder,
     DenseDecoder,
     Encoder,
     GaussianLikelihood,
     gaussian_kl,
+    nb_log_prob,
     reparameterise,
 )
 
@@ -18,6 +20,7 @@ class InformedVAE(nn.Module):
         seed: int = 42,
         l2_lambda: float = 1e-5,
         beta: float = 1.0,
+        likelihood: str = "gaussian",
     ):
         super().__init__()
         torch.manual_seed(seed)
@@ -29,14 +32,28 @@ class InformedVAE(nn.Module):
         self.latent_dim = latent_dim if latent_dim is not None else n_pathways // 2
         self.l2_lambda = l2_lambda
         self.beta = beta
+        self.likelihood_kind = likelihood
 
         self.encoder = Encoder(adj=adj, latent_dim=self.latent_dim)
-        self.decoder = DenseDecoder(
-            latent_dim=self.latent_dim,
-            n_pathways=self.n_pathways,
-            n_genes=self.n_genes,
-        )
-        self.likelihood = GaussianLikelihood()
+
+        if likelihood == "gaussian":
+            self.decoder = DenseDecoder(
+                latent_dim=self.latent_dim,
+                n_pathways=self.n_pathways,
+                n_genes=self.n_genes,
+            )
+            self.likelihood = GaussianLikelihood()
+        elif likelihood == "nb":
+            self.decoder = CountDecoder(
+                latent_dim=self.latent_dim,
+                n_pathways=self.n_pathways,
+                n_genes=self.n_genes,
+            )
+            self.likelihood = None
+        else:
+            raise ValueError(
+                f"unknown likelihood: {likelihood!r} (expected 'gaussian' or 'nb')"
+            )
 
     def encode(self, x: torch.Tensor):
         return self.encoder(x)
@@ -60,8 +77,22 @@ class InformedVAE(nn.Module):
         mu: torch.Tensor,
         log_var: torch.Tensor,
         h: torch.Tensor,
+        counts: torch.Tensor | None = None,
+        library: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        recon_loss = self.likelihood(recon, x)
+        """x is ignored when likelihood_kind == "nb"; counts/library are used instead."""
+        if self.likelihood_kind == "gaussian":
+            recon_loss = self.likelihood(recon, x)
+        else:  # nb
+            if counts is None or library is None:
+                raise ValueError(
+                    "NB likelihood requires both 'counts' and 'library' kwargs"
+                )
+            mu_nb = recon * library
+            recon_loss = (
+                -nb_log_prob(counts, mu_nb, self.decoder.theta).sum(dim=1).mean()
+            )
+
         kl_loss = gaussian_kl(mu, log_var)
         l2_loss = self.l2_lambda * (h**2).sum(dim=1).mean()
         return recon_loss + self.beta * kl_loss + l2_loss

@@ -7,11 +7,10 @@ are assembled from the same parts instead of duplicating code:
     Encoder            genes -> pathway activations h -> (mu, log_var)
     reparameterise     (mu, log_var) -> sampled latent z
     DenseDecoder       z -> reconstructed genes
-    GaussianLikelihood reconstruction loss object (swappable later for NB/ZINB)
-
-Scaffold only: signatures, docstrings and expected returns are given; bodies
-raise NotImplementedError. This is a behavior-preserving refactor, so each
-piece must reproduce what pyvae/models.py::InformedVAE does today.
+    CountDecoder       z -> px_scale (proportions, softmax over genes)
+    GaussianLikelihood reconstruction loss object for the Gaussian path
+    gaussian_kl        closed-form KL( N(mu, sigma^2) || N(0, I) )
+    nb_log_prob        negative binomial log-PMF, for the count-likelihood path
 """
 
 from __future__ import annotations
@@ -59,6 +58,48 @@ def gaussian_kl(mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
     kl : scalar tensor (0-dim).
     """
     return -0.5 * (1 + log_var - mu**2 - torch.exp(log_var)).sum(dim=1).mean()
+
+
+def nb_log_prob(
+    x: torch.Tensor,
+    mu: torch.Tensor,
+    theta: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Elementwise log-PMF of the negative binomial distribution.
+
+    Parameterization
+    ----------------
+    Mean-dispersion form (as in scVI): ``Var(X) = mu + mu**2 / theta``.
+    Large ``theta`` -> Poisson-like; small ``theta`` -> heavily overdispersed.
+
+    Formula
+    -------
+        log p(x | mu, theta) = lgamma(x + theta) - lgamma(theta) - lgamma(x + 1)
+                             + theta * (log(theta) - log(theta + mu))
+                             + x * (log(mu) - log(theta + mu))
+
+    An ``eps`` is added inside every ``log`` to avoid ``log(0) = -inf``.
+
+    Parameters
+    ----------
+    x : (batch, n_genes) integer counts (as float tensor).
+    mu : (batch, n_genes) predicted mean, must be non-negative.
+    theta : (n_genes,) or (batch, n_genes) dispersion, must be positive.
+    eps : small constant added inside every log for numerical stability.
+
+    Returns
+    -------
+    log_prob : same shape as x, elementwise log-PMF.
+    """
+    log_theta_mu_eps = torch.log(theta + mu + eps)
+    return (
+        torch.lgamma(x + theta)
+        - torch.lgamma(theta)
+        - torch.lgamma(x + 1)
+        + theta * (torch.log(theta + eps) - log_theta_mu_eps)
+        + x * (torch.log(mu + eps) - log_theta_mu_eps)
+    )
 
 
 class Encoder(nn.Module):
@@ -135,6 +176,53 @@ class DenseDecoder(nn.Module):
         h_prime = torch.tanh(self.dec_latent(z))
         x_hat = self.dec_out(h_prime)
         return x_hat
+
+
+class CountDecoder(nn.Module):
+    """Count decoder: latent -> pathways (tanh) -> gene logits -> softmax proportions.
+
+    Produces ``px_scale``, the per-cell gene expression proportions summing to 1
+    across the gene axis. The mean of the negative binomial (``mu = px_scale *
+    library``) is computed downstream in ``InformedVAE.loss`` where the per-cell
+    library size is available.
+
+    A learnable per-gene log-dispersion ``px_r`` is stored on the module; its
+    exponential (always positive) is exposed as ``theta`` for the NB likelihood.
+
+    Parameters
+    ----------
+    latent_dim : size of the latent space.
+    n_pathways : width of the hidden pathway layer.
+    n_genes : number of output genes.
+    """
+
+    def __init__(self, latent_dim: int, n_pathways: int, n_genes: int):
+        super().__init__()
+        self.dec_latent = nn.Linear(latent_dim, n_pathways)
+        self.dec_out = nn.Linear(n_pathways, n_genes)
+        # Per-gene log-dispersion, exponentiated in ``theta`` to enforce positivity.
+        self.px_r = nn.Parameter(torch.zeros(n_genes))
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """Decode latent samples to per-cell gene proportions.
+
+        Parameters
+        ----------
+        z : (batch, latent) latent samples.
+
+        Returns
+        -------
+        px_scale : (batch, n_genes) softmax proportions, one row per cell,
+            summing to 1 across the gene axis.
+        """
+        h_prime = torch.tanh(self.dec_latent(z))
+        logits = self.dec_out(h_prime)
+        return torch.softmax(logits, dim=1)
+
+    @property
+    def theta(self) -> torch.Tensor:
+        """Per-gene NB dispersion, exp(px_r), always positive."""
+        return torch.exp(self.px_r)
 
 
 class GaussianLikelihood(nn.Module):
