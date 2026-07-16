@@ -5,7 +5,7 @@ import copy
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from pyvae.components import nb_log_prob
+from pyvae.components import nb_reconstruction_loss
 from pyvae.models import InformedVAE
 
 
@@ -279,11 +279,8 @@ def train_ivae_modern(
                     beta=1.0,
                 ).item() * len(x_batch)
 
-                mu_nb = recon * library
-                recon_term = (
-                    -nb_log_prob(counts_batch, mu_nb, model.decoder.theta)
-                    .sum(dim=1)
-                    .mean()
+                recon_term = nb_reconstruction_loss(
+                    counts_batch, recon, library, model.decoder.theta
                 )
                 val_recon_sum += recon_term.item() * len(x_batch)
 

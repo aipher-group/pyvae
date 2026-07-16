@@ -102,6 +102,33 @@ def nb_log_prob(
     )
 
 
+def nb_reconstruction_loss(
+    counts: torch.Tensor,
+    px_scale: torch.Tensor,
+    library: torch.Tensor,
+    theta: torch.Tensor,
+) -> torch.Tensor:
+    """Negative binomial reconstruction loss, summed over genes, mean over batch.
+
+    Single source of truth for ``mu = px_scale * library`` followed by
+    ``-nb_log_prob(...)``; both InformedVAE.loss and train_ivae_modern call this
+    instead of duplicating the formula.
+
+    Parameters
+    ----------
+    counts : (batch, n_genes) raw counts.
+    px_scale : (batch, n_genes) decoder output, per-cell proportions summing to 1.
+    library : (batch, 1) per-cell total count.
+    theta : (n_genes,) dispersion.
+
+    Returns
+    -------
+    loss : scalar tensor (0-dim).
+    """
+    mu = px_scale * library
+    return -nb_log_prob(counts, mu, theta).sum(dim=1).mean()
+
+
 class Encoder(nn.Module):
     """Informed encoder: genes -> pathway activations h -> (mu, log_var).
 

@@ -7,7 +7,7 @@ from pyvae.components import (
     Encoder,
     GaussianLikelihood,
     gaussian_kl,
-    nb_log_prob,
+    nb_reconstruction_loss,
     reparameterise,
 )
 
@@ -94,9 +94,8 @@ class InformedVAE(nn.Module):
                 raise ValueError(
                     "NB likelihood requires both 'counts' and 'library' kwargs"
                 )
-            mu_nb = recon * library
-            recon_loss = (
-                -nb_log_prob(counts, mu_nb, self.decoder.theta).sum(dim=1).mean()
+            recon_loss = nb_reconstruction_loss(
+                counts, recon, library, self.decoder.theta
             )
 
         kl_loss = gaussian_kl(mu, log_var)
