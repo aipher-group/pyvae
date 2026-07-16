@@ -8,6 +8,28 @@ from torch.utils.data import DataLoader, TensorDataset
 from pyvae.models import InformedVAE
 
 
+def kl_beta_schedule(epoch: int, warmup_epochs: int) -> float:
+    """Linear KL warmup: 0 at epoch=0, ramps to 1.0 at ``epoch >= warmup_epochs``.
+
+    When ``warmup_epochs == 0`` the warmup is disabled and this always returns
+    1.0 (equivalent to standard ELBO training from epoch 0). Guarding this case
+    also avoids the division by zero that a naive ``epoch / warmup_epochs``
+    would trigger.
+
+    Parameters
+    ----------
+    epoch : current epoch index (0-based).
+    warmup_epochs : number of epochs over which to ramp beta from 0 to 1.
+
+    Returns
+    -------
+    beta : float in [0.0, 1.0].
+    """
+    if warmup_epochs <= 0:
+        return 1.0
+    return min(epoch / warmup_epochs, 1.0)
+
+
 def train_ivae(
     model: InformedVAE,
     x_train,

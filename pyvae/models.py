@@ -79,8 +79,14 @@ class InformedVAE(nn.Module):
         h: torch.Tensor,
         counts: torch.Tensor | None = None,
         library: torch.Tensor | None = None,
+        beta: float | None = None,
     ) -> torch.Tensor:
-        """x is ignored when likelihood_kind == "nb"; counts/library are used instead."""
+        """x is ignored when likelihood_kind == "nb"; counts/library are used instead.
+
+        beta : optional override for self.beta on this call only. When None
+            (the default), self.beta is used. Passing an explicit value avoids
+            mutating self.beta across epochs during KL warmup.
+        """
         if self.likelihood_kind == "gaussian":
             recon_loss = self.likelihood(recon, x)
         else:  # nb
@@ -95,4 +101,5 @@ class InformedVAE(nn.Module):
 
         kl_loss = gaussian_kl(mu, log_var)
         l2_loss = self.l2_lambda * (h**2).sum(dim=1).mean()
-        return recon_loss + self.beta * kl_loss + l2_loss
+        beta_eff = self.beta if beta is None else beta
+        return recon_loss + beta_eff * kl_loss + l2_loss
