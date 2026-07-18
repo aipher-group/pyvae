@@ -136,38 +136,62 @@ class Encoder(nn.Module):
     heads. Reproduces InformedVAE.encode, including the clamp of log_var to
     [-3, 3].
 
+    When ``n_cov > 0``, the encoder is conditional: a one-hot covariate matrix
+    is concatenated to the pathway activations before the mean / log-variance
+    heads. The un-concatenated pathway activations are still returned to the
+    caller (used by the L2 term and for pathway interpretation).
+
     Parameters
     ----------
     adj : (n_genes, n_pathways) binary mask tensor.
     latent_dim : size of the latent space.
+    n_cov : width of the auxiliary one-hot covariate. When 0 (default), the
+        encoder is unconditional and behaves exactly as before.
     """
 
-    def __init__(self, adj: torch.Tensor, latent_dim: int):
+    def __init__(self, adj: torch.Tensor, latent_dim: int, n_cov: int = 0):
         super().__init__()
         n_pathways = adj.shape[1]
+        self.n_cov = n_cov
         self.informed = InformedLinear(adj, activation="tanh")
-        self.fc_mean = nn.Linear(n_pathways, latent_dim)
-        self.fc_log_var = nn.Linear(n_pathways, latent_dim)
+        if n_cov > 0:
+            self.fc_mean = nn.Linear(n_pathways + n_cov, latent_dim)
+            self.fc_log_var = nn.Linear(n_pathways + n_cov, latent_dim)
+        else:
+            self.fc_mean = nn.Linear(n_pathways, latent_dim)
+            self.fc_log_var = nn.Linear(n_pathways, latent_dim)
 
     def forward(
-        self, x: torch.Tensor
+        self, x: torch.Tensor, cov: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Encode a batch of expression.
+        """Encode a batch of expression, optionally conditioned on covariates.
 
         Parameters
         ----------
         x : (batch, n_genes) log1p-normalized expression.
+        cov : (batch, n_cov) one-hot covariates. Required iff n_cov > 0.
 
         Returns
         -------
         mu : (batch, latent) posterior mean.
         log_var : (batch, latent) posterior log-variance, clamped to [-3, 3].
-        h : (batch, n_pathways) pathway activations (used by the L2 term and
-            for interpretation).
+        h : (batch, n_pathways) RAW pathway activations (NOT concatenated with
+            cov). Same shape and meaning as before this issue; used by the L2
+            term and for pathway interpretation.
         """
         h = self.informed(x)
-        mu = self.fc_mean(h)
-        log_var = torch.clamp(self.fc_log_var(h), -3, 3)
+        if self.n_cov > 0:
+            if cov is None:
+                raise ValueError(
+                    f"Encoder was built with n_cov={self.n_cov} > 0 but forward() "
+                    f"got cov=None; pass a (batch, {self.n_cov}) covariate tensor"
+                )
+            h_cat = torch.cat([h, cov], dim=1)
+            mu = self.fc_mean(h_cat)
+            log_var = torch.clamp(self.fc_log_var(h_cat), -3, 3)
+        else:
+            mu = self.fc_mean(h)
+            log_var = torch.clamp(self.fc_log_var(h), -3, 3)
         return mu, log_var, h
 
 
@@ -176,32 +200,52 @@ class DenseDecoder(nn.Module):
 
     Reproduces InformedVAE.decode (dec_latent + dec_out).
 
+    When ``n_cov > 0``, the decoder is conditional: a covariate term
+    ``cov_decoder(cov)`` is added directly to the reconstructed gene values.
+    There is no softmax on this decoder, so no ordering issue: the covariate
+    term is simply an additive shift on the output.
+
     Parameters
     ----------
     latent_dim : size of the latent space.
     n_pathways : width of the hidden pathway layer.
     n_genes : number of output genes.
+    n_cov : width of the auxiliary one-hot covariate. When 0 (default), the
+        decoder is unconditional and behaves exactly as before.
     """
 
-    def __init__(self, latent_dim: int, n_pathways: int, n_genes: int):
+    def __init__(self, latent_dim: int, n_pathways: int, n_genes: int, n_cov: int = 0):
         super().__init__()
+        self.n_cov = n_cov
         self.dec_latent = nn.Linear(latent_dim, n_pathways)
         self.dec_out = nn.Linear(n_pathways, n_genes)
+        if n_cov > 0:
+            # No bias: the per-gene baseline is provided by dec_out's bias;
+            # this layer should only capture the shift due to the label.
+            self.cov_decoder = nn.Linear(n_cov, n_genes, bias=False)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, cov: torch.Tensor | None = None) -> torch.Tensor:
         """Decode latent samples back to gene space.
 
         Parameters
         ----------
         z : (batch, latent) latent samples.
+        cov : (batch, n_cov) one-hot covariates. Required iff n_cov > 0.
 
         Returns
         -------
         recon : (batch, n_genes) reconstructed expression.
         """
-
         h_prime = torch.tanh(self.dec_latent(z))
         x_hat = self.dec_out(h_prime)
+        if self.n_cov > 0:
+            if cov is None:
+                raise ValueError(
+                    f"DenseDecoder was built with n_cov={self.n_cov} > 0 but "
+                    f"forward() got cov=None; pass a (batch, {self.n_cov}) "
+                    f"covariate tensor"
+                )
+            x_hat = x_hat + self.cov_decoder(cov)
         return x_hat
 
 
@@ -216,26 +260,41 @@ class CountDecoder(nn.Module):
     A learnable per-gene log-dispersion ``px_r`` is stored on the module; its
     exponential (always positive) is exposed as ``theta`` for the NB likelihood.
 
+    When ``n_cov > 0``, the decoder is conditional: a covariate term
+    ``cov_decoder(cov)`` is added to the gene logits BEFORE the softmax. This
+    ordering matters. Adding the covariate before softmax means the label
+    shifts genes' log-proportions relative to each other (the standard way
+    scVI/scGen and other conditional generative single-cell models work).
+    Adding it after softmax would break the "proportions sum to 1" property.
+
     Parameters
     ----------
     latent_dim : size of the latent space.
     n_pathways : width of the hidden pathway layer.
     n_genes : number of output genes.
+    n_cov : width of the auxiliary one-hot covariate. When 0 (default), the
+        decoder is unconditional and behaves exactly as before.
     """
 
-    def __init__(self, latent_dim: int, n_pathways: int, n_genes: int):
+    def __init__(self, latent_dim: int, n_pathways: int, n_genes: int, n_cov: int = 0):
         super().__init__()
+        self.n_cov = n_cov
         self.dec_latent = nn.Linear(latent_dim, n_pathways)
         self.dec_out = nn.Linear(n_pathways, n_genes)
+        if n_cov > 0:
+            # No bias: the per-gene baseline is provided by dec_out's bias;
+            # this layer should only capture the shift due to the label.
+            self.cov_decoder = nn.Linear(n_cov, n_genes, bias=False)
         # Per-gene log-dispersion, exponentiated in ``theta`` to enforce positivity.
         self.px_r = nn.Parameter(torch.zeros(n_genes))
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, cov: torch.Tensor | None = None) -> torch.Tensor:
         """Decode latent samples to per-cell gene proportions.
 
         Parameters
         ----------
         z : (batch, latent) latent samples.
+        cov : (batch, n_cov) one-hot covariates. Required iff n_cov > 0.
 
         Returns
         -------
@@ -244,6 +303,14 @@ class CountDecoder(nn.Module):
         """
         h_prime = torch.tanh(self.dec_latent(z))
         logits = self.dec_out(h_prime)
+        if self.n_cov > 0:
+            if cov is None:
+                raise ValueError(
+                    f"CountDecoder was built with n_cov={self.n_cov} > 0 but "
+                    f"forward() got cov=None; pass a (batch, {self.n_cov}) "
+                    f"covariate tensor"
+                )
+            logits = logits + self.cov_decoder(cov)
         return torch.softmax(logits, dim=1)
 
     @property

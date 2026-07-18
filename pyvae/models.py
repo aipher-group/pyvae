@@ -21,6 +21,7 @@ class InformedVAE(nn.Module):
         l2_lambda: float = 1e-5,
         beta: float = 1.0,
         likelihood: str = "gaussian",
+        n_cov: int = 0,
     ):
         super().__init__()
         torch.manual_seed(seed)
@@ -33,14 +34,16 @@ class InformedVAE(nn.Module):
         self.l2_lambda = l2_lambda
         self.beta = beta
         self.likelihood_kind = likelihood
+        self.n_cov = n_cov
 
-        self.encoder = Encoder(adj=adj, latent_dim=self.latent_dim)
+        self.encoder = Encoder(adj=adj, latent_dim=self.latent_dim, n_cov=n_cov)
 
         if likelihood == "gaussian":
             self.decoder = DenseDecoder(
                 latent_dim=self.latent_dim,
                 n_pathways=self.n_pathways,
                 n_genes=self.n_genes,
+                n_cov=n_cov,
             )
             self.likelihood = GaussianLikelihood()
         elif likelihood == "nb":
@@ -48,6 +51,7 @@ class InformedVAE(nn.Module):
                 latent_dim=self.latent_dim,
                 n_pathways=self.n_pathways,
                 n_genes=self.n_genes,
+                n_cov=n_cov,
             )
             self.likelihood = None
         else:
@@ -55,19 +59,19 @@ class InformedVAE(nn.Module):
                 f"unknown likelihood: {likelihood!r} (expected 'gaussian' or 'nb')"
             )
 
-    def encode(self, x: torch.Tensor):
-        return self.encoder(x)
+    def encode(self, x: torch.Tensor, cov: torch.Tensor | None = None):
+        return self.encoder(x, cov)
 
     def reparameterise(self, mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
         return reparameterise(mu, log_var)
 
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        return self.decoder(z)
+    def decode(self, z: torch.Tensor, cov: torch.Tensor | None = None) -> torch.Tensor:
+        return self.decoder(z, cov)
 
-    def forward(self, x: torch.Tensor):
-        mu, log_var, h = self.encode(x)
+    def forward(self, x: torch.Tensor, cov: torch.Tensor | None = None):
+        mu, log_var, h = self.encode(x, cov)
         z = self.reparameterise(mu, log_var)
-        recon = self.decode(z)
+        recon = self.decode(z, cov)
         return recon, mu, log_var, h
 
     def loss(
