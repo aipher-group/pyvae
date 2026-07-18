@@ -242,3 +242,48 @@ def build_model_config(
         f"model_kind '{model_kind}' is not supported. "
         "Choose from: ivae_reactome_hierarchical_d2, ivae_reactome."
     )
+
+
+def swap_condition(cov: pd.DataFrame, from_label: str, to_label: str) -> pd.DataFrame:
+    """Return a copy of ``cov`` with the one-hot condition columns flipped.
+
+    Zeroes the ``condition_{from_label}`` column and sets
+    ``condition_{to_label}`` to 1, for every row. All other columns (e.g.
+    ``cell_type_*``) are left unchanged. Both column names must already exist
+    in ``cov.columns``.
+
+    Used to build the ``cov_to`` argument of
+    ``InformedVAE.predict_counterfactual``: encode with the cell's real
+    covariate, decode with the swapped covariate, and read out the predicted
+    counts under the counterfactual condition.
+
+    Parameters
+    ----------
+    cov : covariate DataFrame produced by ``pd.get_dummies(obs[[...]])``, with
+        one-hot columns including at least ``condition_{from_label}`` and
+        ``condition_{to_label}``.
+    from_label : the condition label the cells were actually observed under
+        (e.g. ``"control"``).
+    to_label : the counterfactual condition label to decode under (e.g.
+        ``"stimulated"``).
+
+    Returns
+    -------
+    cov_to : a copy of ``cov`` with the two condition columns flipped. Other
+        columns (cell type, etc.) are unchanged.
+    """
+    from_col = f"condition_{from_label}"
+    to_col = f"condition_{to_label}"
+    missing = [c for c in (from_col, to_col) if c not in cov.columns]
+    if missing:
+        raise KeyError(
+            f"columns not found in cov: {missing}; expected both "
+            f"{from_col!r} and {to_col!r}. Make sure pd.get_dummies was called "
+            f"on the FULL obs (or use pd.Categorical with an explicit categories "
+            f"list) so both condition columns exist before splitting into "
+            f"subsets."
+        )
+    cov_to = cov.copy()
+    cov_to[from_col] = 0
+    cov_to[to_col] = 1
+    return cov_to
