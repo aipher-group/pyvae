@@ -106,3 +106,44 @@ class InformedVAE(nn.Module):
         l2_loss = self.l2_lambda * (h**2).sum(dim=1).mean()
         beta_eff = self.beta if beta is None else beta
         return recon_loss + beta_eff * kl_loss + l2_loss
+
+    @torch.no_grad()
+    def predict_counterfactual(
+        self,
+        x: torch.Tensor,
+        library: torch.Tensor,
+        cov_from: torch.Tensor,
+        cov_to: torch.Tensor,
+    ) -> torch.Tensor:
+        """Predict expression under a different covariate, holding latent biology fixed.
+
+        Encodes ``x`` under its real covariate ``cov_from`` to obtain the
+        posterior MEAN (mu) -- not a stochastic sample of z -- then decodes
+        that mean under the swapped covariate ``cov_to``. Using the mean
+        (rather than sampling) keeps the prediction deterministic: the only
+        thing that changes between two calls with the same inputs is the
+        covariate, not random noise from reparameterise().
+
+        Requires ``likelihood_kind == "nb"``; raises otherwise since the
+        return value is expressed in count space using ``library``.
+
+        Parameters
+        ----------
+        x : (batch, n_genes) log1p-normalized expression of the real cells.
+        library : (batch, 1) real per-cell library size to scale the prediction into.
+        cov_from : (batch, n_cov) the cells' true one-hot covariate.
+        cov_to : (batch, n_cov) the one-hot covariate to decode under instead.
+
+        Returns
+        -------
+        predicted_counts : (batch, n_genes) predicted mean counts under cov_to
+            (px_scale * library), directly comparable to real count profiles.
+        """
+        if self.likelihood_kind != "nb":
+            raise ValueError(
+                f"predict_counterfactual requires likelihood_kind == 'nb', "
+                f"got {self.likelihood_kind!r}"
+            )
+        mu, _log_var, _h = self.encode(x, cov_from)
+        px_scale = self.decode(mu, cov_to)
+        return px_scale * library
