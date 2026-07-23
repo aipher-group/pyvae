@@ -69,12 +69,14 @@ pathway.
   dataset loader (`load_kang`) for end-to-end pipelines.
 - `swap_condition` — flip one-hot condition columns in a covariate DataFrame,
   for building the `cov_to` argument of `predict_counterfactual`.
+- `set_all_seeds` — seed Python's `random`, NumPy, and PyTorch (CPU + CUDA)
+  in one call, for reproducible runs.
 
 ## Installation
 
 ```bash
 pip install pyvae                      # from PyPI
-conda install -c conda-forge pyvae     # from conda-forge (after feedstock merge)
+conda install -c conda-forge pyvae     # from conda-forge
 pixi add pyvae                         # into a pixi project
 ```
 
@@ -191,8 +193,12 @@ pixi publish --target-dir ./conda-dist          # build + copy locally (no uploa
 pixi publish --to https://prefix.dev/<channel>  # or push to a channel directly
 ```
 
-Distribution through **conda-forge** is handled by a feedstock rather than a
-direct upload. A ready-to-submit recipe and step-by-step instructions live in
+Distribution through **conda-forge** is handled by the
+[`pyvae-feedstock`](https://github.com/conda-forge/pyvae-feedstock) rather
+than a direct upload; the package is already live there. New PyPI releases
+are picked up automatically by `regro-cf-autotick-bot`, which opens a
+version-bump PR on the feedstock — no action needed here. The original
+submission recipe and instructions for manual recipe changes live in
 [`conda-recipe/`](conda-recipe/). On a tagged release, `.github/workflows/release.yml`
 builds and verifies both artifacts and attaches the `noarch` conda package to
 the GitHub Release.
