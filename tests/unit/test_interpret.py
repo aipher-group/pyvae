@@ -244,6 +244,39 @@ def test_integrated_gradients_zero_when_baseline_equals_input():
     torch.testing.assert_close(attr, torch.zeros_like(attr))
 
 
+def test_integrated_gradients_satisfies_completeness_axiom():
+    """sum_g attribution[:, g] ~= h(x)[:, pathway_idx] - h(baseline)[:, pathway_idx].
+
+    Completeness is the defining mathematical property of Integrated
+    Gradients (Sundararajan et al., 2017): the attributions, summed over all
+    input features, must recover the model's actual output difference
+    between x and the baseline. This is a stronger check than "runs and
+    returns finite numbers" -- it validates the accumulated-gradient formula
+    itself, not just its shape.
+
+    With a finite number of Riemann-sum steps the two sides only match up to
+    a discretization error that shrinks as `steps` grows, so we use a high
+    step count and a loose-but-meaningful tolerance rather than exact
+    equality.
+    """
+    torch.manual_seed(0)
+    model = _tiny_model()
+    x = torch.randn(4, 20)
+    baseline = torch.zeros_like(x)
+    pathway_idx = 2
+
+    attr = integrated_gradients(model, x, pathway_idx, baseline=baseline, steps=200)
+
+    model.eval()
+    with torch.no_grad():
+        _, _, h_x = model.encode(x)
+        _, _, h_baseline = model.encode(baseline)
+    delta_h = h_x[:, pathway_idx] - h_baseline[:, pathway_idx]
+
+    sum_attr = attr.sum(dim=1)
+    torch.testing.assert_close(sum_attr, delta_h, atol=1e-2, rtol=1e-2)
+
+
 def test_integrated_gradients_finite_and_signed():
     """Attributions are finite and include both positive and negative values."""
     torch.manual_seed(0)
