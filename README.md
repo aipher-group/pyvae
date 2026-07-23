@@ -10,6 +10,9 @@ features.
 
 [![CI](https://github.com/aipher-group/pyvae/actions/workflows/ci.yml/badge.svg)](https://github.com/aipher-group/pyvae/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![conda-forge](https://img.shields.io/conda/vn/conda-forge/pyvae.svg)](https://anaconda.org/conda-forge/pyvae)
+[![PyPI Version](https://img.shields.io/pypi/v/pyvae)](https://pypi.org/project/pyvae/)
+
 
 ---
 
@@ -24,26 +27,59 @@ $$
 
 Gene expression is high-dimensional (~20 000 genes) but structured: genes act
 together in *pathways*. `pyvae` restricts the encoder's first layer so only the
-gene → pathway connections that exist in Reactome are allowed, enforced with a
-binary mask on the weight matrix, $W_{\text{eff}} = W \odot M$, where
+gene → pathway connections that exist in Reactome are allowed. A binary mask
+enforces this on the weight matrix: $W_{\text{eff}} = W \odot M$, where
 $M_{ji}=1$ iff gene $i$ belongs to pathway $j$. This reduces parameters, injects
 prior biological knowledge, and makes each latent node interpretable as a
 pathway.
 
 ## Features
 
-- `InformedLinear` — a masked linear layer enforcing arbitrary connectivity priors.
-- `InformedVAE` — the full encoder/decoder with the reparameterisation trick and
-  a combined reconstruction + KL + L2 loss.
-- `train_ivae` — a training loop with gradient clipping and early stopping.
-- Reactome helpers (`build_model_config`, `sync_gexp_adj`) and a Kang PBMC
-  dataset loader (`load_kang`) for end-to-end pipelines.
+### Models
+
+`InformedLinear` is a masked linear layer that enforces arbitrary connectivity
+priors. `InformedVAE` builds a full encoder/decoder around it, using the
+reparameterisation trick and a combined reconstruction, KL, and L2 loss. You
+configure it through constructor kwargs. `likelihood` picks between
+`"gaussian"` (MSE on log1p-normalized expression, the default) and `"nb"` (a
+negative-binomial likelihood on raw counts, implemented scVI-style in pure
+PyTorch with no `scvi-tools` dependency). `n_cov` sets the width of an
+auxiliary one-hot covariate (cell type, condition, or both), which the model
+concatenates into the encoder and decoder to support conditional inference.
+
+### Training
+
+`train_ivae` is the legacy training loop: gradient clipping plus early
+stopping. `train_ivae_modern` trains the count model instead, adding KL
+warmup, AdamW with decoupled weight decay, cosine LR annealing, and
+best-weight restore.
+
+### Interpretation
+
+`InformedVAE.predict_counterfactual` (NB models only) encodes a cell under
+one covariate and decodes it under another, returning predicted counts. It
+uses the posterior mean rather than a stochastic sample, so the prediction
+stays deterministic, which is what you want for a question like "what would
+this control cell look like if stimulated?" `bayes_factor_da` computes a
+signed Bayes factor per pathway between two groups of cells, based on
+Monte-Carlo pairing of raw pathway activations. `integrated_gradients`
+attributes a single pathway's activation back to each input gene
+(Sundararajan et al., 2017), implemented in pure PyTorch.
+
+### Data helpers
+
+Reactome helpers (`build_model_config`, `sync_gexp_adj`) and a Kang PBMC
+dataset loader (`load_kang`) cover end-to-end pipelines. `swap_condition`
+flips the one-hot condition columns in a covariate DataFrame, which is how
+you build the `cov_to` argument for `predict_counterfactual`. `set_all_seeds`
+seeds Python's `random`, NumPy, and PyTorch (CPU and CUDA) in a single call,
+for reproducible runs.
 
 ## Installation
 
 ```bash
 pip install pyvae                      # from PyPI
-conda install -c conda-forge pyvae     # from conda-forge (after feedstock merge)
+conda install -c conda-forge pyvae     # from conda-forge
 pixi add pyvae                         # into a pixi project
 ```
 
@@ -51,25 +87,25 @@ pixi add pyvae                         # into a pixi project
 
 ### GPU acceleration
 
-`pyvae` only requires `torch>=2.3,<3` and never pins a platform, so which
-hardware you can accelerate depends entirely on which PyTorch build your install
-command pulls. Use this table to pick the right path:
+`pyvae` only requires `torch>=2.3,<3` and never pins a platform. Which
+hardware you can accelerate depends entirely on which PyTorch build your
+install command pulls. Use this table to pick the right path:
 
 | Your machine | `pip install pyvae` | `conda install -c conda-forge pyvae` | Accelerated out of the box? |
 |---|---|---|---|
 | **NVIDIA CUDA (Linux/Windows)** | default `torch` wheel is the CUDA build | conda-forge ships CUDA `pytorch` variants | ✅ yes, on both |
-| **Apple Silicon (macOS arm64)** | standard wheel includes **MPS** (Metal) | conda-forge osx-arm64 build includes MPS | ✅ yes — use `device="mps"` |
-| **AMD ROCm (Linux)** | gets the CUDA wheel, which won't drive an AMD GPU | conda-forge has **no ROCm** builds → CPU only | ❌ no — see ROCm steps below |
-| **Intel macOS / generic CPU** | CPU wheel | CPU build | n/a — CPU only |
+| **Apple Silicon (macOS arm64)** | standard wheel includes **MPS** (Metal) | conda-forge osx-arm64 build includes MPS | ✅ yes (use `device="mps"`) |
+| **AMD ROCm (Linux)** | gets the CUDA wheel, which won't drive an AMD GPU | conda-forge has **no ROCm** builds → CPU only | ❌ no (see ROCm steps below) |
+| **Intel macOS / generic CPU** | CPU wheel | CPU build | n/a (CPU only) |
 
 **CUDA and Apple-Silicon users need no extra steps.** Verify at runtime with
 `python -c "import torch; print(torch.cuda.is_available())"` (CUDA) or
 `torch.backends.mps.is_available()` (macOS).
 
-**AMD ROCm users must install torch from PyTorch's ROCm index** — ROCm wheels
-exist neither on PyPI nor on conda-forge, so `conda install` is a dead end for
-AMD GPUs. Install ROCm torch *first*, then pyvae (pip then sees the constraint
-already satisfied and leaves torch alone):
+**AMD ROCm users must install torch from PyTorch's ROCm index.** ROCm wheels
+exist neither on PyPI nor on conda-forge, so `conda install` is a dead end
+for AMD GPUs. Install ROCm torch *first*, then pyvae; pip then sees the
+constraint already satisfied and leaves torch alone:
 
 ```bash
 pip install torch torchvision torchaudio \
@@ -141,8 +177,9 @@ pip install -e ".[dev]" && pytest tests/ -v
 
 ## Releasing
 
-Both distribution channels are wired up. Bump the version in `pyproject.toml`
-(`[project].version` **and** `[tool.pixi.package].version`) before releasing.
+This repo publishes to both PyPI and conda-forge. Before releasing, bump the
+version in `pyproject.toml` (both `[project].version` and
+`[tool.pixi.package].version`).
 
 **PyPI** (Trusted Publishing in CI on a `v*` tag, or locally via the isolated
 `publish` env):
@@ -153,18 +190,21 @@ pixi run -e publish check-dist     # twine metadata check
 pixi run -e publish publish-pypi   # upload (set TWINE_REPOSITORY=testpypi for TestPyPI)
 ```
 
-**conda** — built as a single `noarch` package by pixi:
+**conda** (built as a single `noarch` package by pixi):
 
 ```bash
 pixi publish --target-dir ./conda-dist          # build + copy locally (no upload)
 pixi publish --to https://prefix.dev/<channel>  # or push to a channel directly
 ```
 
-Distribution through **conda-forge** is handled by a feedstock rather than a
-direct upload. A ready-to-submit recipe and step-by-step instructions live in
-[`conda-recipe/`](conda-recipe/). On a tagged release, `.github/workflows/release.yml`
-builds and verifies both artifacts and attaches the `noarch` conda package to
-the GitHub Release.
+The [`pyvae-feedstock`](https://github.com/conda-forge/pyvae-feedstock) handles
+conda-forge distribution instead of a direct upload, and the package is
+already live there. `regro-cf-autotick-bot` picks up new PyPI releases
+automatically and opens a version-bump PR on the feedstock, so no action is
+needed here. The original submission recipe and instructions for manual
+recipe changes live in [`conda-recipe/`](conda-recipe/). On a tagged release,
+`.github/workflows/release.yml` builds and verifies both artifacts and
+attaches the `noarch` conda package to the GitHub Release.
 
 ## Project layout
 
@@ -173,22 +213,25 @@ pyvae/
 ├── __init__.py    public API
 ├── utils.py       seeding utilities
 ├── layers.py      InformedLinear (masked layer)
-├── models.py      InformedVAE
-├── train.py       training loop
+├── components.py  Encoder, DenseDecoder, CountDecoder, likelihoods, helpers
+├── models.py      InformedVAE (composition of components)
+├── train.py       training loops: train_ivae, train_ivae_modern
 ├── datasets.py    Kang dataset loader
-└── bio.py         Reactome adjacency helpers
-tests/             contract tests
+├── bio.py         Reactome adjacency helpers, swap_condition
+└── interpret.py   bayes_factor_da, integrated_gradients
+tests/             contract + unit tests
 conda-recipe/      conda-forge recipe + submission guide
 ```
 
 ## Acknowledgements
 
-`pyvae` is a PyTorch reimplementation that builds on earlier Keras informed-VAE
-work directed by Carlos Loucera:
-
-- Pelin Gundogdu — [babelomics/ivae_scorer](https://github.com/babelomics/ivae_scorer)
-- Alberto Esteban-Medina — [albertoem77/robustness_informed_TFM](https://github.com/albertoem77/robustness_informed_TFM)
-- Sara Fernandez — [saraafdezz/robustness_informed_TFG](https://github.com/saraafdezz/robustness_informed_TFG)
+`pyvae` is a PyTorch reimplementation that builds on earlier Keras
+informed-VAE work directed by Carlos Loucera, with contributions from Pelin
+Gundogdu ([babelomics/ivae_scorer](https://github.com/babelomics/ivae_scorer)),
+Alberto Esteban-Medina
+([albertoem77/robustness_informed_TFM](https://github.com/albertoem77/robustness_informed_TFM)),
+and Sara Fernandez
+([saraafdezz/robustness_informed_TFG](https://github.com/saraafdezz/robustness_informed_TFG)).
 
 ## License
 

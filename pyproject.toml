@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyvae"
-version = "0.1.1"
+version = "0.2.0"
 description = "Informed Variational Autoencoder (iVAE) with biologically constrained encoder layers."
 readme = "README.md"
 license = "MIT"
@@ -51,7 +51,7 @@ exclude = ["tests*"]
 
 [tool.pixi.workspace]
 name = "pyvae"
-version = "0.1.1"
+version = "0.2.0"
 authors = ["Amir Aynede <amiraynede@gmail.com>", "Carlos Loucera <clou@us.es>"]
 channels = ["conda-forge", "pytorch", "nvidia"]
 platforms = ["osx-arm64", "linux-64", "win-64"]
@@ -66,7 +66,7 @@ preview = ["pixi-build"]
 # single `noarch: python` conda package that installs on every platform.
 [tool.pixi.package]
 name = "pyvae"
-version = "0.1.1"
+version = "0.2.0"
 
 [tool.pixi.package.build.backend]
 name = "pixi-build-python"
