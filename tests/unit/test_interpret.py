@@ -250,14 +250,16 @@ def test_integrated_gradients_satisfies_completeness_axiom():
     Completeness is the defining mathematical property of Integrated
     Gradients (Sundararajan et al., 2017): the attributions, summed over all
     input features, must recover the model's actual output difference
-    between x and the baseline. This is a stronger check than "runs and
-    returns finite numbers" -- it validates the accumulated-gradient formula
-    itself, not just its shape.
+    between x and the baseline.
 
     With a finite number of Riemann-sum steps the two sides only match up to
     a discretization error that shrinks as `steps` grows, so we use a high
     step count and a loose-but-meaningful tolerance rather than exact
     equality.
+
+    Mukund Sundararajan, Ankur Taly, and Qiqi Yan. 2017. Axiomatic attribution for deep networks. 
+    In Proceedings of the 34th International Conference on Machine Learning - Volume 70 (ICML'17). 
+    JMLR.org, 3319–3328.
     """
     torch.manual_seed(0)
     model = _tiny_model()
