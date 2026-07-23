@@ -10,6 +10,7 @@ def test_public_api_exists():
     assert hasattr(mod, "InformedLinear")
     assert hasattr(mod, "InformedVAE")
     assert hasattr(mod, "train_ivae")
+    assert hasattr(mod, "train_ivae_modern")
 
 
 def test_train_signature_contract():
@@ -24,6 +25,26 @@ def test_train_signature_contract():
         "batch_size",
         "patience",
         "lr",
+        "device",
+    ]
+    assert list(sig.parameters.keys()) == expected
+
+
+def test_train_ivae_modern_signature_contract():
+    sig = inspect.signature(mod.train_ivae_modern)
+    expected = [
+        "model",
+        "x_train",
+        "x_val",
+        "x_counts_train",
+        "x_counts_val",
+        "epochs",
+        "batch_size",
+        "patience",
+        "lr",
+        "weight_decay",
+        "warmup_epochs",
+        "max_grad_norm",
         "device",
     ]
     assert list(sig.parameters.keys()) == expected
