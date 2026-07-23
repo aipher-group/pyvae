@@ -35,12 +35,40 @@ pathway.
 
 ## Features
 
-- `InformedLinear` — a masked linear layer enforcing arbitrary connectivity priors.
-- `InformedVAE` — the full encoder/decoder with the reparameterisation trick and
-  a combined reconstruction + KL + L2 loss.
-- `train_ivae` — a training loop with gradient clipping and early stopping.
+### Models
+
+- `InformedLinear` — masked linear layer enforcing arbitrary connectivity priors.
+- `InformedVAE` — full encoder/decoder with the reparameterisation trick and
+  a combined reconstruction + KL + L2 loss. Configurable via constructor kwargs:
+  - `likelihood="gaussian" | "nb"` — MSE on log1p-normalized expression (default)
+    or a negative-binomial likelihood on raw counts (scVI-style, pure PyTorch,
+    no `scvi-tools` dependency).
+  - `n_cov` — width of an auxiliary one-hot covariate (cell type, condition, or
+    both) concatenated into the encoder and decoder for conditional inference.
+
+### Training
+
+- `train_ivae` — legacy training loop with gradient clipping and early stopping.
+- `train_ivae_modern` — training loop for the count model with KL warmup,
+  AdamW + decoupled weight decay, cosine LR annealing, and best-weight restore.
+
+### Interpretation
+
+- `predict_counterfactual` (on `InformedVAE`, NB only) — encode under one
+  covariate, decode under another, returns predicted counts. Deterministic
+  (uses the posterior mean, not a stochastic sample) for "what would this
+  control cell look like if stimulated?"-style questions.
+- `bayes_factor_da` — signed Bayes factor per pathway between two groups of
+  cells, based on Monte-Carlo pairing of raw pathway activations.
+- `integrated_gradients` — per-gene attribution for a single pathway's
+  activation (Sundararajan et al., 2017), pure-PyTorch.
+
+### Data helpers
+
 - Reactome helpers (`build_model_config`, `sync_gexp_adj`) and a Kang PBMC
   dataset loader (`load_kang`) for end-to-end pipelines.
+- `swap_condition` — flip one-hot condition columns in a covariate DataFrame,
+  for building the `cov_to` argument of `predict_counterfactual`.
 
 ## Installation
 
@@ -176,11 +204,13 @@ pyvae/
 ├── __init__.py    public API
 ├── utils.py       seeding utilities
 ├── layers.py      InformedLinear (masked layer)
-├── models.py      InformedVAE
-├── train.py       training loop
+├── components.py  Encoder, DenseDecoder, CountDecoder, likelihoods, helpers
+├── models.py      InformedVAE (composition of components)
+├── train.py       training loops: train_ivae, train_ivae_modern
 ├── datasets.py    Kang dataset loader
-└── bio.py         Reactome adjacency helpers
-tests/             contract tests
+├── bio.py         Reactome adjacency helpers, swap_condition
+└── interpret.py   bayes_factor_da, integrated_gradients
+tests/             contract + unit tests
 conda-recipe/      conda-forge recipe + submission guide
 ```
 
