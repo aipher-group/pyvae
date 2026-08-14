@@ -2,3 +2,4 @@ data/
 outputs/
 .ipynb_checkpoints/
 *.pt
+resources/
