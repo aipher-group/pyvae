@@ -5,7 +5,7 @@ from pyvae.bio import (
     sync_gexp_adj,
 )
 from pyvae.datasets import load_kang
-from pyvae.interpret import bayes_factor_da, integrated_gradients
+from pyvae.interpret import bayes_factor_da, integrated_gradients, pathway_unit_fidelity
 from pyvae.layers import InformedLinear
 from pyvae.models import InformedVAE
 from pyvae.train import train_ivae, train_ivae_modern
@@ -24,4 +24,5 @@ __all__ = [
     "swap_condition",
     "bayes_factor_da",
     "integrated_gradients",
+    "pathway_unit_fidelity",
 ]

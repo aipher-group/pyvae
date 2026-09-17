@@ -179,3 +179,221 @@ def integrated_gradients(
 
     averaged_gradient = accumulated_gradient / steps
     return (x - baseline) * averaged_gradient
+
+def pathway_unit_fidelity(
+    model,
+    x,
+    adj,
+    *,
+    cov=None,
+    min_genes=10,
+    batch_size=1024,
+    eps=1e-8,
+):
+    """Correlate each pathway unit's activation against its member genes.
+
+    For each pathway j, compute the Pearson correlation between the encoder's
+    pathway-layer activation h[:, j] and the mean z-scored expression of the
+    genes annotated to pathway j in the adjacency matrix. A unit with |corr|
+    near 1 tracks its pathway's activity as a whole; a unit near 0 does not
+    track it at all; a unit with negative corr encodes the pathway upside-down.
+
+    This is a diagnostic instrument, not a metric to be optimized. Its purpose
+    is to reveal whether InformedLinear's gene-membership constraint alone is
+    enough to make a unit represent its pathway, or whether the encoder's
+    freedom in weight signs and magnitudes lets a unit drift into being a
+    detector for one loud member gene instead.
+
+    Parameters
+    ----------
+    model : InformedVAE
+        A trained model. Must have ``.encode(x[, cov]) -> (mu, logvar, h)`` or
+        expose ``h`` through the encoder in some other documented way. The
+        function calls ``model.eval()`` and runs inside ``torch.no_grad()``.
+    x : torch.Tensor or numpy.ndarray or pandas.DataFrame
+        Expression matrix of shape (n_cells, n_genes). Must have the same
+        gene axis as ``adj`` (i.e. same order of columns as adj's rows).
+    adj : torch.Tensor or numpy.ndarray or pandas.DataFrame
+        Binary gene-to-pathway adjacency of shape (n_genes, n_pathways).
+        If a DataFrame is passed, its columns are used as pathway names in
+        the returned DataFrame index. If not, pathways are named "pathway_j".
+    cov : torch.Tensor or numpy.ndarray, optional
+        Covariate matrix of shape (n_cells, n_cov). Required if the model was
+        trained with ``n_cov > 0``. Raises ValueError if the model needs a
+        covariate and none is given.
+    min_genes : int, default 10
+        Pathways with fewer than this many annotated genes are skipped.
+        Their ``corr`` field will be NaN. A correlation on very few genes
+        (e.g. 3) is noisy enough to mislead more than inform.
+    batch_size : int, default 1024
+        Number of cells to encode per batch. Purely a memory-management
+        choice; does not affect the result.
+    eps : float, default 1e-8
+        Small constant added to standard deviations before dividing, to
+        avoid divide-by-zero when a gene has zero variance in the sample.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per pathway, indexed by pathway name. Columns:
+
+        - ``n_genes`` : number of annotated genes for this pathway
+        - ``corr`` : Pearson correlation between h[:, j] and the mean z-scored
+          expression of the pathway's member genes. NaN if n_genes < min_genes
+          or if the unit had zero variance across cells.
+        - ``abs_corr`` : absolute value of ``corr``
+        - ``sign`` : +1 if corr > 0, -1 if corr < 0, 0 if corr is NaN or 0
+
+    Notes
+    -----
+    The z-scoring is per gene across cells, not per cell across genes. This
+    matches the standard "expression signature" convention: a gene's activity
+    is measured relative to its own distribution across the sample.
+
+    The mean-z aggregation across a pathway's member genes gives all members
+    equal weight. This is by design: the failure mode we care about is a unit
+    dominated by one loud gene, and comparing that unit to an unweighted mean
+    of all members is exactly how we detect the domination.
+
+    Comparing this function's output across two models trained with different
+    encoder constraints (e.g. baseline vs. nonneg+standardize) is the primary
+    use. A model where fidelity improves under constraints is a model where
+    the constraints removed a real freedom that was hurting representation.
+
+    Examples
+    --------
+    >>> fid = pathway_unit_fidelity(model, x, adj_df)
+    >>> fid.sort_values("abs_corr", ascending=False).head()
+    >>> print(f"median |corr|: {fid['abs_corr'].median():.3f}")
+    >>> print(f"inverted fraction: {(fid['sign'] < 0).mean():.3f}")
+    """
+    import numpy as np
+    import pandas as pd
+    import torch
+
+    # --- Coerce inputs ---
+    if isinstance(x, pd.DataFrame):
+        x_arr = x.values
+    elif isinstance(x, np.ndarray):
+        x_arr = x
+    elif isinstance(x, torch.Tensor):
+        x_arr = x.detach().cpu().numpy()
+    else:
+        raise TypeError(f"x must be Tensor, ndarray, or DataFrame; got {type(x).__name__}")
+    x_arr = np.asarray(x_arr, dtype=np.float32)
+
+    if isinstance(adj, pd.DataFrame):
+        pathway_names = list(adj.columns)
+        adj_arr = adj.values
+    elif isinstance(adj, np.ndarray):
+        adj_arr = adj
+        pathway_names = [f"pathway_{j}" for j in range(adj.shape[1])]
+    elif isinstance(adj, torch.Tensor):
+        adj_arr = adj.detach().cpu().numpy()
+        pathway_names = [f"pathway_{j}" for j in range(adj.shape[1])]
+    else:
+        raise TypeError(f"adj must be Tensor, ndarray, or DataFrame; got {type(adj).__name__}")
+    adj_arr = np.asarray(adj_arr, dtype=np.float32)
+
+    # --- Shape checks ---
+    n_cells, n_genes = x_arr.shape
+    n_genes_adj, n_pathways = adj_arr.shape
+    if n_genes != n_genes_adj:
+        raise ValueError(
+            f"Gene axis mismatch: x has {n_genes} genes, adj has {n_genes_adj}."
+        )
+
+    # --- Covariate handling ---
+    model_n_cov = getattr(model, "n_cov", 0)
+    if model_n_cov > 0 and cov is None:
+        raise ValueError(
+            f"Model was trained with n_cov={model_n_cov} but no cov was provided."
+        )
+    if model_n_cov == 0 and cov is not None:
+        raise ValueError(
+            "Model has n_cov=0 but a cov was provided. Pass cov=None."
+        )
+    if cov is not None:
+        if isinstance(cov, pd.DataFrame):
+            cov_arr = cov.values
+        elif isinstance(cov, np.ndarray):
+            cov_arr = cov
+        elif isinstance(cov, torch.Tensor):
+            cov_arr = cov.detach().cpu().numpy()
+        else:
+            raise TypeError(f"cov must be Tensor, ndarray, or DataFrame; got {type(cov).__name__}")
+        cov_arr = np.asarray(cov_arr, dtype=np.float32)
+        if cov_arr.shape[0] != n_cells:
+            raise ValueError(
+                f"cov has {cov_arr.shape[0]} rows but x has {n_cells} cells."
+            )
+
+    # --- Encode to get h ---
+    device = next(model.parameters()).device
+    was_training = model.training
+    model.eval()
+
+    h_batches = []
+    try:
+        with torch.no_grad():
+            for i in range(0, n_cells, batch_size):
+                x_b = torch.from_numpy(x_arr[i : i + batch_size]).to(device)
+                if cov is not None:
+                    c_b = torch.from_numpy(cov_arr[i : i + batch_size]).to(device)
+                    _, _, h_b = model.encode(x_b, c_b)
+                else:
+                    _, _, h_b = model.encode(x_b)
+                h_batches.append(h_b.detach().cpu().numpy())
+    finally:
+        if was_training:
+            model.train()
+
+    h_arr = np.concatenate(h_batches, axis=0)
+    assert h_arr.shape == (n_cells, n_pathways), (
+        f"Expected h shape ({n_cells}, {n_pathways}), got {h_arr.shape}. "
+        "Does model.encode return (mu, logvar, h) as expected?"
+    )
+
+    # --- Z-score expression per gene across cells ---
+    x_mean = x_arr.mean(axis=0, keepdims=True)
+    x_std = x_arr.std(axis=0, keepdims=True)
+    x_z = (x_arr - x_mean) / (x_std + eps)  # shape (n_cells, n_genes)
+
+    # --- Per-pathway: correlate h[:, j] with mean z of member genes ---
+    n_genes_per_pathway = adj_arr.sum(axis=0).astype(int)  # shape (n_pathways,)
+    corr = np.full(n_pathways, np.nan, dtype=np.float64)
+
+    for j in range(n_pathways):
+        n_j = n_genes_per_pathway[j]
+        if n_j < min_genes:
+            continue  # corr stays NaN
+
+        # Mean z-scored expression across the j-th pathway's members
+        member_mask = adj_arr[:, j].astype(bool)   # shape (n_genes,)
+        mean_z_j = x_z[:, member_mask].mean(axis=1)  # shape (n_cells,)
+
+        h_j = h_arr[:, j]  # shape (n_cells,)
+
+        # Pearson correlation; guard against zero-variance columns
+        h_std = h_j.std()
+        mz_std = mean_z_j.std()
+        if h_std < eps or mz_std < eps:
+            continue  # corr stays NaN — unit or member-mean is degenerate
+
+        h_c = h_j - h_j.mean()
+        mz_c = mean_z_j - mean_z_j.mean()
+        corr[j] = float(np.mean(h_c * mz_c) / (h_std * mz_std))
+
+    abs_corr = np.abs(corr)
+    sign = np.where(np.isnan(corr), 0, np.sign(corr)).astype(int)
+
+    return pd.DataFrame(
+        {
+            "n_genes": n_genes_per_pathway,
+            "corr": corr,
+            "abs_corr": abs_corr,
+            "sign": sign,
+        },
+        index=pd.Index(pathway_names, name="pathway"),
+    )
+
