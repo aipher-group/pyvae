@@ -35,18 +35,38 @@ def bayes_factor_da(
     pathway_names: list[str] | None = None,
     seed: int | None = None,
 ) -> pd.DataFrame:
-    """Signed differential-activation Bayes factor per pathway, group A vs B.
+    """Signed logit(Mann-Whitney AUC) per pathway between groups A and B.
 
-    Encodes ``x_a`` and ``x_b`` (with ``cov_a`` / ``cov_b`` if the model is
-    conditional) to obtain their raw pathway activations ``h_a`` and ``h_b``,
-    Monte-Carlo samples ``n_pairs`` random ``(a, b)`` pairs per pathway, and
-    estimates ``p = P(h_a > h_b)`` with ties split 0.5 / 0.5 (so a pathway
-    with identical activation in both groups gets ``BF ~= 0`` rather than
-    ``+/- inf``). ``p`` is clipped to ``[eps, 1 - eps]`` before the log-odds
-    so a single lopsided sample can't produce an infinite BF.
+    Despite the name, this function does not compute a Bayes factor in the
+    sense of expiMap or scVI. It computes ``logit(P(h_a > h_b))`` where the
+    probability is estimated by Monte-Carlo sampling of ``n_pairs`` random
+    ``(a, b)`` pairs from the two groups' encoder outputs, with ties split
+    0.5. That probability, with ties split, is exactly the Mann-Whitney AUC
+    statistic — which ``scipy.stats.mannwhitneyu`` computes in closed form
+    without any sampling noise. The Monte-Carlo pair sampling here is a
+    Bayes-factor-shaped ritual that costs precision without buying anything.
 
-    The sign of the returned BF is meaningful: positive means the pathway
-    sits higher in group A than in group B.
+    Nothing in this function integrates over a posterior. ``h`` is the raw
+    output of the encoder's masked linear + tanh — deterministic given ``x``
+    and (if present) ``cov``. A genuine differential-activation Bayes factor
+    would need ``n_samples`` draws of ``z`` from ``q(z|x)`` per cell, then
+    a log-ratio of posterior probabilities. See ``differential_expression``
+    for the decoder-side equivalent that does that properly.
+
+    What the sign of the returned value reports is the direction of a
+    latent unit, not the direction of the underlying pathway's biology.
+    If the encoder learned an inverted representation of a pathway (which
+    ``pathway_unit_fidelity`` will show by returning ``sign = -1`` for
+    that pathway), a positive value here means the *unit* is up-shifted
+    in group A — which corresponds to the pathway being *down-shifted*.
+    Interpretation therefore requires cross-referencing this function's
+    output with fidelity signs, or constraining the encoder so signs
+    are guaranteed positive (``nonneg_encoder=True`` on ``InformedVAE``).
+
+    Kept named ``bayes_factor_da`` to preserve caller compatibility; the
+    function's behaviour is unchanged. The docstring is what changed, so
+    downstream text describing "the Bayes factor of the interferon pathway"
+    can be rewritten with accurate language.
 
     Parameters
     ----------
@@ -56,17 +76,22 @@ def bayes_factor_da(
     cov_a, cov_b : optional one-hot covariates for the two groups. Required
         iff the model was built with ``n_cov > 0``.
     n_pairs : number of Monte-Carlo pairs to draw per pathway. Larger is
-        less noisy; a few thousand is usually sufficient.
+        less noisy; a few thousand is usually sufficient. Set to a value
+        much smaller than ``n_a * n_b`` — otherwise you're doing a slow,
+        noisy approximation of the exact Mann-Whitney AUC.
     pathway_names : optional list of length ``n_pathways``. Used as the
         DataFrame index; if not provided, integer indices ``0..n_pathways-1``
         are used.
-    seed : optional RNG seed for the pair sampling, for reproducibility. When
-        ``None`` (default), the current global torch RNG state is used.
+    seed : optional RNG seed for the pair sampling, for reproducibility.
+        When ``None`` (default), the current global torch RNG state is used.
 
     Returns
     -------
     DataFrame indexed by pathway, columns ``["bf", "p"]``, sorted by
-    ``|bf|`` descending.
+    ``|bf|`` descending. Column ``bf`` is ``logit(p)`` clipped to
+    ``[eps, 1-eps]`` before taking logs so a fully-lopsided sample cannot
+    produce ``+/- inf``. Despite the name ``bf``, this is not a Bayes
+    factor; see the docstring above.
     """
     eps = 1e-4
 
