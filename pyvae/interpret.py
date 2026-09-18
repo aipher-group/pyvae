@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import pandas as pd
 import torch
+import numpy as np
 
 from pyvae.models import InformedVAE
 
@@ -421,4 +422,291 @@ def pathway_unit_fidelity(
         },
         index=pd.Index(pathway_names, name="pathway"),
     )
+
+def differential_expression(
+    model,
+    x_a,
+    x_b,
+    cov_a=None,
+    cov_b=None,
+    n_samples: int = 25,
+    n_pairs: int = 2000,
+    delta: float = 0.25,
+    gene_names: list[str] | None = None,
+    seed: int | None = None,
+    eps: float = 1e-8,
+    min_detection: float = 0.0,
+) -> "pd.DataFrame":
+    """Posterior differential expression per gene, group A vs B, on decoder proportions.
+
+    Follows Boyeau et al. 2019. For each of ``n_samples`` rounds, sample one
+    ``z`` per cell from ``q(z|x)`` for both groups, decode to per-cell gene
+    proportions, then draw ``n_pairs`` random ``(a, b)`` pairs and record
+    per-pair, per-gene ``log2`` ratios of proportions. Aggregate across all
+    rounds and pairs to get posterior summaries per gene.
+
+    This is the decoder-side counterpart to ``bayes_factor_da`` and is what
+    the latter's name pretends to do — the encoder-side function integrates
+    nothing over the posterior because ``h`` is deterministic given ``x``.
+    Here every round draws fresh ``z`` samples, so the returned ``bf`` is a
+    real Monte-Carlo posterior Bayes factor.
+
+    Because gene expression has an unambiguous polarity (a positive
+    ``lfc_mean`` means the gene went up, full stop), pathway rankings built
+    on top of this function do not need the "cross-reference the sign against
+    unit fidelity" caveat that ``bayes_factor_da`` carries. This is why
+    ``pathway_activity`` — the read-out that turns per-gene DE into per-pathway
+    rankings — is designed to run on this function's output rather than on
+    the encoder's ``h``.
+
+    Requires ``model.likelihood_kind == "nb"``. The Gaussian decoder produces
+    raw predicted expression rather than proportions, so the log-ratio
+    construction below would be misleading; raises otherwise.
+
+    Parameters
+    ----------
+    model : InformedVAE
+        A trained model with ``likelihood_kind == "nb"``.
+    x_a : (n_a, n_genes) array-like
+        Log1p-normalised expression for group A. Any dtype accepted by
+        ``as_float_tensor`` (torch, numpy, pandas, scipy sparse).
+    x_b : (n_b, n_genes) array-like
+        Same for group B.
+    cov_a, cov_b : (n_a, n_cov), (n_b, n_cov) or None
+        One-hot covariates. Required iff the model was built with ``n_cov > 0``.
+    n_samples : int, default 25
+        Number of rounds. Each round draws fresh ``z`` samples for every cell.
+        Higher values reduce posterior noise but scale linearly with cost.
+    n_pairs : int, default 2000
+        Number of random ``(a, b)`` pairs drawn per round. Total pair-samples
+        is ``n_samples * n_pairs``.
+    delta : float, default 0.25
+        DE threshold on ``|log2fc|``. A gene is called "differentially
+        expressed" in a sample iff ``|log2fc| > delta``. ``proba_de`` is the
+        fraction of samples where this holds.
+    gene_names : list of str or None
+        Gene labels for the returned DataFrame's index. If None, integer
+        indices 0..n_genes-1 are used.
+    seed : int or None
+        RNG seed. Both the ``z`` sampling and the pair sampling are seeded
+        from it, so identical seeds reproduce results bit-for-bit.
+    eps : float, default 1e-8
+        Small constant added before dividing proportions and taking logs,
+        so a gene with a zero-decoded proportion in one cell doesn't produce
+        ``inf`` in the log ratio.
+    min_detection : float, default 0.0
+        Optional threshold on decoded proportions. A pair contributes to the
+        ``detection_rate`` count for a gene iff both cells' decoded proportion
+        for that gene exceeds ``min_detection``. A gene where
+        ``detection_rate`` is much less than 1 has its ``lfc_mean`` and
+        ``proba_de`` computed on very few real pairs — usually a sign to
+        exclude it from downstream analysis.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per gene, sorted by ``proba_de`` descending then
+        ``|lfc_mean|`` descending. Sorting matters because ``proba_de`` is
+        a fraction of finitely many draws and saturates at exactly 1.0,
+        leaving every tied gene in gene-matrix column order (which is not
+        an order). Columns:
+
+        - ``proba_de`` : fraction of samples where ``|log2fc| > delta``.
+        - ``bf`` : ``logit(proba_de)``. Clipped so that ``|bf|`` never
+          exceeds what the total sample size ``n_samples * n_pairs`` can
+          justify — specifically, ``proba_de`` is clipped to
+          ``[1/(2*total), 1 - 1/(2*total)]`` before the logit. This
+          replaces an arbitrary ``eps`` clip with the bound the data
+          actually supports.
+        - ``lfc_mean`` : mean ``log2`` fold change across all sampled pairs.
+        - ``lfc_std`` : standard deviation of ``log2`` fold change.
+        - ``proba_up`` : fraction of samples where ``log2fc > 0``. Together
+          with ``lfc_mean`` this tells you whether the gene went up in A vs B.
+        - ``detection_rate`` : fraction of samples where both cells in the
+          pair had decoded proportion above ``min_detection``.
+
+    Notes
+    -----
+    Complexity is 2 encoder passes plus ``2 * n_samples`` decoder passes —
+    the ``mu, log_var`` for both groups are computed once and reused across
+    rounds. Defaults (25 rounds × 2000 pairs) are fast on CPU.
+
+    Cost of using proportions (Boyeau's choice) rather than mean counts:
+    the returned ``lfc_mean`` is a log-ratio of transcriptional "budget
+    shares" rather than absolute concentrations, so a gene that goes from
+    1% to 2% of a cell's budget shows ``lfc_mean = 1``, regardless of
+    whether library size changed. This is scale-invariant, which is usually
+    what you want; if you specifically need concentration changes, decode
+    ``px_scale * library`` explicitly instead.
+
+    Read the ``detection_rate`` column of your top-20 genes before trusting
+    them. A gene ranked #1 with ``detection_rate=0.02`` is being ranked on
+    a handful of pairs and is more likely a sampling artifact than a real
+    finding.
+    """
+    import numpy as np
+    import pandas as pd
+    import torch
+
+    from pyvae.components import as_float_tensor
+
+    if model.likelihood_kind != "nb":
+        raise ValueError(
+            f"differential_expression requires model.likelihood_kind == 'nb', "
+            f"got {model.likelihood_kind!r}. The Gaussian decoder produces raw "
+            f"predicted expression, not per-cell proportions, so the log-ratio "
+            f"construction here would be misleading."
+        )
+
+    # --- Coerce inputs to float tensors ---
+    x_a_t = as_float_tensor(x_a, name="x_a")
+    x_b_t = as_float_tensor(x_b, name="x_b")
+    if cov_a is not None:
+        cov_a_t = as_float_tensor(cov_a, name="cov_a")
+    else:
+        cov_a_t = None
+    if cov_b is not None:
+        cov_b_t = as_float_tensor(cov_b, name="cov_b")
+    else:
+        cov_b_t = None
+
+    # --- Covariate guards ---
+    n_cov = getattr(model, "n_cov", 0)
+    if n_cov > 0 and (cov_a_t is None or cov_b_t is None):
+        raise ValueError(
+            f"model was trained with n_cov={n_cov} but cov_a and/or cov_b are None."
+        )
+    if n_cov == 0 and (cov_a_t is not None or cov_b_t is not None):
+        raise ValueError(
+            "model has n_cov=0 but cov_a or cov_b was provided. Pass cov=None "
+            "for both, or rebuild the model with n_cov > 0."
+        )
+
+    # --- Encode both groups once; sample z fresh per round below ---
+    device = next(model.parameters()).device
+    x_a_t = x_a_t.to(device)
+    x_b_t = x_b_t.to(device)
+    if cov_a_t is not None:
+        cov_a_t = cov_a_t.to(device)
+        cov_b_t = cov_b_t.to(device)
+
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            mu_a, log_var_a, _ = model.encode(x_a_t, cov_a_t)
+            mu_b, log_var_b, _ = model.encode(x_b_t, cov_b_t)
+    finally:
+        if was_training:
+            model.train()
+
+    n_a = mu_a.shape[0]
+    n_b = mu_b.shape[0]
+    n_genes = x_a_t.shape[1]
+
+    # --- Seeded generators for reproducibility ---
+    if seed is not None:
+        pair_gen = torch.Generator(device=device)
+        pair_gen.manual_seed(seed)
+        z_gen = torch.Generator(device=device)
+        z_gen.manual_seed(seed + 1)
+    else:
+        pair_gen = None
+        z_gen = None
+
+    # --- Accumulators for the per-gene statistics ---
+    # Kept on CPU as numpy arrays to avoid keeping (n_samples * n_pairs, n_genes)
+    # in GPU memory (that would be ~50k * 5k * 4 bytes = 1 GB for defaults).
+    de_count = np.zeros(n_genes, dtype=np.float64)      # |lfc| > delta
+    up_count = np.zeros(n_genes, dtype=np.float64)      # lfc > 0
+    lfc_sum = np.zeros(n_genes, dtype=np.float64)       # sum of lfc
+    lfc_sq_sum = np.zeros(n_genes, dtype=np.float64)    # sum of lfc^2 (for std)
+    det_count = np.zeros(n_genes, dtype=np.float64)     # both cells > min_detection
+    total_pairs = n_samples * n_pairs
+
+    sigma_a = torch.exp(0.5 * log_var_a)
+    sigma_b = torch.exp(0.5 * log_var_b)
+
+    with torch.no_grad():
+        for _ in range(n_samples):
+            # Reparameterisation: fresh z per cell per round. This is the
+            # posterior integration Boyeau requires.
+            eps_a = torch.randn(mu_a.shape, generator=z_gen, device=device)
+            eps_b = torch.randn(mu_b.shape, generator=z_gen, device=device)
+            z_a = mu_a + sigma_a * eps_a
+            z_b = mu_b + sigma_b * eps_b
+
+            # Decode all cells to per-cell proportions.
+            px_a = model.decode(z_a, cov_a_t)
+            px_b = model.decode(z_b, cov_b_t)
+
+            # Sample n_pairs random (a, b) indices for this round.
+            idx_a = torch.randint(0, n_a, (n_pairs,), generator=pair_gen, device=device)
+            idx_b = torch.randint(0, n_b, (n_pairs,), generator=pair_gen, device=device)
+
+            px_a_paired = px_a[idx_a]  # (n_pairs, n_genes)
+            px_b_paired = px_b[idx_b]
+
+            log2fc = torch.log2((px_a_paired + eps) / (px_b_paired + eps))
+
+            # Move to CPU numpy for accumulation.
+            log2fc_np = log2fc.cpu().numpy()
+            px_a_np = px_a_paired.cpu().numpy()
+            px_b_np = px_b_paired.cpu().numpy()
+
+            de_count += (np.abs(log2fc_np) > delta).sum(axis=0)
+            up_count += (log2fc_np > 0).sum(axis=0)
+            lfc_sum += log2fc_np.sum(axis=0)
+            lfc_sq_sum += (log2fc_np ** 2).sum(axis=0)
+            detected = (px_a_np > min_detection) & (px_b_np > min_detection)
+            det_count += detected.sum(axis=0)
+
+    # --- Compute per-gene summary statistics ---
+    proba_de = de_count / total_pairs
+    proba_up = up_count / total_pairs
+    lfc_mean = lfc_sum / total_pairs
+    lfc_var = lfc_sq_sum / total_pairs - lfc_mean ** 2
+    lfc_std = np.sqrt(np.maximum(lfc_var, 0))
+    detection_rate = det_count / total_pairs
+
+    # Clip proba_de at what the finite sample can support, per Carlos's spec:
+    # 1 / (2 * total) rather than an arbitrary constant. This bounds |bf| at
+    # what the sample size can actually justify.
+    clip_lo = 1.0 / (2.0 * total_pairs)
+    p_clipped = np.clip(proba_de, clip_lo, 1.0 - clip_lo)
+    bf = np.log(p_clipped / (1.0 - p_clipped))
+
+    # --- Build the DataFrame ---
+    if gene_names is None:
+        index = pd.RangeIndex(n_genes, name="gene")
+    else:
+        if len(gene_names) != n_genes:
+            raise ValueError(
+                f"gene_names has length {len(gene_names)}, expected n_genes={n_genes}"
+            )
+        index = pd.Index(gene_names, name="gene")
+
+    df = pd.DataFrame(
+        {
+            "proba_de": proba_de,
+            "bf": bf,
+            "lfc_mean": lfc_mean,
+            "lfc_std": lfc_std,
+            "proba_up": proba_up,
+            "detection_rate": detection_rate,
+        },
+        index=index,
+    )
+
+    # Sort by proba_de desc, then |lfc_mean| desc. This matters because
+    # proba_de saturates at exactly 1.0 for strongly-DE genes, leaving every
+    # tied gene in gene-matrix column order (which is not an order).
+    df = df.assign(_abs_lfc=lambda d: d["lfc_mean"].abs())
+    df = df.sort_values(
+        by=["proba_de", "_abs_lfc"],
+        ascending=[False, False],
+        kind="mergesort",  # stable, so ties break by prior order (which is _abs_lfc)
+    ).drop(columns="_abs_lfc")
+
+    return df
 
