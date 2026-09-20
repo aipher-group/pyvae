@@ -1013,4 +1013,288 @@ def pathway_activity(
 
     return df
 
+def pseudobulk_paired_test(
+    counts,
+    donor_ids,
+    condition,
+    label_a,
+    label_b,
+    *,
+    gene_names=None,
+    min_donors: int = 3,
+    pseudocount: float = 1.0,
+    target_sum: float = 1e6,
+) -> "pd.DataFrame":
+    """Paired Wilcoxon per gene between two conditions, aggregated per donor.
+
+    Fixes the pseudo-replication problem in cell-level differential-expression
+    tests (Squair et al. 2021): a Wilcoxon over cells treats every cell as an
+    independent observation, so 24,673 cells from 8 donors report the same
+    statistical power as 24,673 truly-independent samples. That's not what's
+    happening: cells within a donor share genetic background, batch and
+    library-prep, so they are not independent. Every p-value comes out
+    understated, hundreds of genes print as adjusted-p = 0 regardless of
+    effect size, and the ranking becomes uninformative.
+
+    The fix is to collapse each donor to a single pseudobulk profile per
+    condition, then run a paired test across donors. The unit of independence
+    then matches the unit of experimental replication.
+
+    Pipeline
+    --------
+    1. Sum each donor's cell-level counts, per condition, to get one
+       pseudobulk profile per (donor, condition) pair (Squair et al.'s
+       recommended pooling — sum, not mean).
+    2. Library-size normalise each pseudobulk sample to ``target_sum`` per
+       cell (default: 1e6 → counts-per-million) so donors with different
+       total mRNA output are comparable.
+    3. Compute per-donor, per-gene log2 fold change:
+           lfc[donor, gene] = log2((cpm_a + pseudocount) /
+                                   (cpm_b + pseudocount))
+       The pseudocount avoids log(0) when a gene is unobserved in one
+       condition for a donor.
+    4. Keep only donors present in both conditions (this is what makes
+       the Wilcoxon *paired*).
+    5. Per gene, run a two-sided paired Wilcoxon on the vector of
+       per-donor log-fold-changes.
+    6. BH-adjust the p-values across genes.
+    7. Sort by ``pvalue`` asc, then ``|lfc_mean|`` desc. This matters at
+       small n: at n=8 donors, the exact-null two-sided Wilcoxon
+       distribution has a discrete floor of ``2 / 2^n = 2/256 ~ 0.0078``,
+       so hundreds of genes will hit exactly this p-value at once. Sorting
+       by p alone would leave them in gene-matrix column order, which is
+       not an order. ``|lfc_mean|`` breaks the tie by effect size.
+
+    Parameters
+    ----------
+    counts : array-like of shape (n_cells, n_genes)
+        Raw count matrix. Any dtype accepted by numpy.asarray (torch tensor,
+        numpy array, pandas DataFrame, scipy sparse). Cell-level counts;
+        the pooling happens here.
+    donor_ids : array-like of length n_cells
+        Donor identifier per cell (any hashable type — strings usually).
+    condition : array-like of length n_cells
+        Condition label per cell.
+    label_a, label_b : hashable
+        The two condition labels to compare. Values in ``condition`` must
+        contain both.
+    gene_names : list of str, optional
+        Gene labels for the returned DataFrame's index. If None, integer
+        indices 0..n_genes-1 are used.
+    min_donors : int, default 3
+        Minimum number of donors that must have data in BOTH conditions
+        for the test to run at all. Below this, raises rather than
+        producing meaningless numbers. The paired Wilcoxon on n < 3 donors
+        cannot reach conventional significance thresholds even with a
+        perfectly separating effect, so refusing early is more useful than
+        emitting a table of NaN.
+    pseudocount : float, default 1.0
+        Added to cpm values before the log-ratio, so a gene with zero
+        counts in one donor-condition pair produces a finite (though
+        capped) log fold change rather than -inf or +inf.
+    target_sum : float, default 1e6
+        Per-donor per-condition library-size normalisation target
+        (counts-per-million by default).
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per gene, indexed by gene name (or integer 0..n_genes-1).
+        Sorted by ``pvalue`` ascending, then ``|lfc_mean|`` descending.
+        Columns:
+
+        - ``n_donors_paired`` : donors present in both conditions.
+        - ``lfc_mean`` : mean of per-donor log2 fold changes.
+        - ``lfc_median`` : median of per-donor log2 fold changes (more
+          robust to a single outlier donor).
+        - ``pvalue`` : two-sided paired Wilcoxon p-value.
+        - ``qvalue`` : BH-adjusted p-value.
+        - ``sign`` : +1 if lfc_mean > 0, -1 if < 0, 0 otherwise.
+
+    Raises
+    ------
+    ValueError
+        If ``counts.shape[0]`` doesn't match len(donor_ids) or
+        len(condition); if either label is absent from ``condition``; if
+        fewer than ``min_donors`` donors appear in both conditions.
+
+    Notes
+    -----
+    Why not just use scanpy's rank_genes_groups per donor? Because that
+    still ends up cell-level. The pooling has to happen before the test,
+    not after — that's the whole point of pseudobulk.
+
+    Why library-size normalise before taking the ratio, rather than
+    letting the ratio absorb it? Because a donor whose condition-A
+    pseudobulk is 3x larger than their condition-B pseudobulk shouldn't
+    push every gene's ratio up by 3x — that's a technical artifact of
+    total sequencing depth, not biology.
+
+    Why sum (not mean) for the pseudobulk aggregation? Because the sum
+    is what a re-run of bulk RNA-seq on that donor's condition-A cells
+    would measure. Mean would collapse the per-cell variance into
+    a per-donor mean and understate uncertainty.
+
+    Why paired Wilcoxon rather than paired t-test? No distributional
+    assumption on the log-fold-changes; robust to a single outlier
+    donor; matches Squair et al. 2021's recommendation.
+    """
+    import numpy as np
+    import pandas as pd
+    from scipy import stats
+
+    # --- Coerce counts to a plain numpy array ---
+    try:
+        import torch
+        if isinstance(counts, torch.Tensor):
+            counts_arr = counts.detach().cpu().numpy()
+        else:
+            counts_arr = None
+    except ImportError:
+        counts_arr = None
+    if counts_arr is None:
+        if isinstance(counts, pd.DataFrame):
+            counts_arr = counts.values
+        else:
+            try:
+                from scipy import sparse
+                if sparse.issparse(counts):
+                    counts_arr = counts.toarray()
+                else:
+                    counts_arr = np.asarray(counts)
+            except ImportError:
+                counts_arr = np.asarray(counts)
+    counts_arr = np.asarray(counts_arr, dtype=np.float64)
+
+    n_cells, n_genes = counts_arr.shape
+
+    # --- Shape checks on the alignment vectors ---
+    donor_ids = np.asarray(donor_ids)
+    condition = np.asarray(condition)
+    if donor_ids.shape[0] != n_cells:
+        raise ValueError(
+            f"donor_ids has length {donor_ids.shape[0]}; "
+            f"expected {n_cells} to match counts.shape[0]."
+        )
+    if condition.shape[0] != n_cells:
+        raise ValueError(
+            f"condition has length {condition.shape[0]}; "
+            f"expected {n_cells} to match counts.shape[0]."
+        )
+
+    # --- Label existence in the data ---
+    unique_labels = set(condition.tolist())
+    if label_a not in unique_labels:
+        raise ValueError(
+            f"label_a={label_a!r} not present in `condition`. "
+            f"Present labels: {sorted(unique_labels)}"
+        )
+    if label_b not in unique_labels:
+        raise ValueError(
+            f"label_b={label_b!r} not present in `condition`. "
+            f"Present labels: {sorted(unique_labels)}"
+        )
+
+    # --- Pseudobulk: sum cell counts per (donor, condition) ---
+    # Build a lookup {(donor, condition): pseudobulk vector} using boolean masks.
+    unique_donors = np.unique(donor_ids)
+    pseudobulk_a = {}
+    pseudobulk_b = {}
+    for donor in unique_donors:
+        mask_a = (donor_ids == donor) & (condition == label_a)
+        mask_b = (donor_ids == donor) & (condition == label_b)
+        if mask_a.any():
+            pseudobulk_a[donor] = counts_arr[mask_a].sum(axis=0)
+        if mask_b.any():
+            pseudobulk_b[donor] = counts_arr[mask_b].sum(axis=0)
+
+    # --- Keep only donors present in BOTH conditions (this is the paired part) ---
+    paired_donors = sorted(set(pseudobulk_a.keys()) & set(pseudobulk_b.keys()))
+    n_paired = len(paired_donors)
+
+    if n_paired < min_donors:
+        raise ValueError(
+            f"Only {n_paired} donor(s) present in both conditions "
+            f"({label_a!r} and {label_b!r}); need at least min_donors={min_donors}. "
+            f"A paired Wilcoxon on fewer donors cannot reach conventional "
+            f"significance thresholds even with a perfectly separating effect."
+        )
+
+    # --- Stack the paired pseudobulks into (n_donors, n_genes) matrices ---
+    mat_a = np.stack([pseudobulk_a[d] for d in paired_donors])  # (n_paired, n_genes)
+    mat_b = np.stack([pseudobulk_b[d] for d in paired_donors])
+
+    # --- Library-size normalise each row to target_sum ---
+    lib_a = mat_a.sum(axis=1, keepdims=True)
+    lib_b = mat_b.sum(axis=1, keepdims=True)
+    # Guard against a donor with zero total counts in one condition (shouldn't
+    # happen for real Kang data, but a fixture could hit this).
+    lib_a = np.where(lib_a > 0, lib_a, 1.0)
+    lib_b = np.where(lib_b > 0, lib_b, 1.0)
+    cpm_a = mat_a / lib_a * target_sum
+    cpm_b = mat_b / lib_b * target_sum
+
+    # --- Per-donor per-gene log2 fold change ---
+    lfc = np.log2((cpm_a + pseudocount) / (cpm_b + pseudocount))  # (n_paired, n_genes)
+
+    # --- Per-gene mean, median, and paired Wilcoxon ---
+    lfc_mean = lfc.mean(axis=0)
+    lfc_median = np.median(lfc, axis=0)
+    pvalue = np.full(n_genes, np.nan, dtype=np.float64)
+
+    for g in range(n_genes):
+        diffs = lfc[:, g]
+        try:
+            # scipy.stats.wilcoxon on the differences directly. Two-sided default.
+            # For all-zero diffs, wilcoxon raises with newer scipy or returns NaN;
+            # we catch and leave the entry NaN.
+            _stat, p = stats.wilcoxon(diffs, alternative="two-sided")
+            pvalue[g] = float(p)
+        except (ValueError, RuntimeWarning):
+            pass
+
+    # --- BH-adjusted q-values (uses _benjamini_hochberg from Phase 1f-iii) ---
+    qvalue = _benjamini_hochberg(pvalue)
+
+    sign = np.where(
+        np.isnan(lfc_mean),
+        0,
+        np.where(lfc_mean > 0, 1, np.where(lfc_mean < 0, -1, 0)),
+    ).astype(int)
+
+    # --- Build the DataFrame ---
+    if gene_names is None:
+        index = pd.RangeIndex(n_genes, name="gene")
+    else:
+        if len(gene_names) != n_genes:
+            raise ValueError(
+                f"gene_names has length {len(gene_names)}, expected n_genes={n_genes}"
+            )
+        index = pd.Index(gene_names, name="gene")
+
+    df = pd.DataFrame(
+        {
+            "n_donors_paired": np.full(n_genes, n_paired, dtype=np.int64),
+            "lfc_mean": lfc_mean,
+            "lfc_median": lfc_median,
+            "pvalue": pvalue,
+            "qvalue": qvalue,
+            "sign": sign,
+        },
+        index=index,
+    )
+
+    # Sort by pvalue asc, then |lfc_mean| desc — because of the 2/256 floor at
+    # n=8 donors, hundreds of genes will tie on pvalue and need |lfc_mean| to
+    # separate them.
+    df = df.assign(_abs_lfc=lambda d: d["lfc_mean"].abs())
+    df = df.sort_values(
+        by=["pvalue", "_abs_lfc"],
+        ascending=[True, False],
+        kind="mergesort",
+        na_position="last",
+    ).drop(columns="_abs_lfc")
+
+    return df
+
 
