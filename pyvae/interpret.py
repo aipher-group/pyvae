@@ -710,3 +710,307 @@ def differential_expression(
 
     return df
 
+def _benjamini_hochberg(pvalues):
+    """Benjamini-Hochberg (1995) FDR-adjusted p-values.
+
+    Standard implementation: sort p-values ascending, adjust each by
+    ``p * n / rank``, then enforce monotonicity from the largest rank down
+    so a smaller adjusted p never exceeds a larger one. Returns adjusted
+    p-values in the original order of the input.
+
+    NaN inputs propagate as NaN in the output — they contribute nothing
+    to the count ``n``, so pathways skipped for small size don't inflate
+    the adjustment burden on the pathways we actually tested.
+
+    Parameters
+    ----------
+    pvalues : array-like of float, shape (m,)
+        Raw p-values from independent tests. May contain NaN entries
+        (these pass through untouched).
+
+    Returns
+    -------
+    numpy.ndarray, shape (m,), dtype float64
+        BH-adjusted p-values, clipped to [0, 1]. NaN positions in the
+        input remain NaN in the output.
+
+    Notes
+    -----
+    Behaviour matches ``statsmodels.stats.multitest.multipletests(
+    method='fdr_bh')`` for the all-finite case. We implement it inline
+    to avoid a statsmodels dependency for a single-function purpose.
+    """
+    import numpy as np
+
+    p = np.asarray(pvalues, dtype=np.float64)
+    n_total = len(p)
+    finite_mask = np.isfinite(p)
+    finite_p = p[finite_mask]
+    n_finite = len(finite_p)
+
+    if n_finite == 0:
+        return p.copy()
+
+    # Sort finite p-values ascending and remember the permutation.
+    order = np.argsort(finite_p)
+    p_sorted = finite_p[order]
+
+    # Raw BH: p[i] * n / (i+1), 1-indexed rank.
+    ranks = np.arange(1, n_finite + 1)
+    q_sorted = p_sorted * n_finite / ranks
+
+    # Enforce monotonicity from the top: adjusted[i] = min(adjusted[i:]).
+    # Equivalent to running minimum right-to-left.
+    q_sorted = np.minimum.accumulate(q_sorted[::-1])[::-1]
+
+    # Clip to [0, 1] — the ratio can exceed 1 before clipping.
+    q_sorted = np.clip(q_sorted, 0.0, 1.0)
+
+    # Invert the sort to get q-values back in the original finite order.
+    q_finite = np.empty_like(q_sorted)
+    q_finite[order] = q_sorted
+
+    # Rebuild the full output with NaN in the skipped positions.
+    q = np.full(n_total, np.nan, dtype=np.float64)
+    q[finite_mask] = q_finite
+    return q
+
+
+def pathway_activity(
+    de,
+    adj,
+    *,
+    statistic: str = "lfc_mean",
+    min_genes: int = 5,
+    center: bool = True,
+) -> "pd.DataFrame":
+    """Per-pathway competitive Mann-Whitney ranking from a per-gene DE table.
+
+    For each pathway, tests whether the DE statistic (default ``lfc_mean``)
+    of its member genes is systematically different from the DE statistic
+    of the non-member genes in the panel. This is the "competitive"
+    formulation used by GSEA and camera: it compares members to a
+    background of non-members, rather than comparing members to a
+    hypothesised null of zero ("self-contained").
+
+    Competitive over self-contained is deliberate. A self-contained test
+    is dominated by whichever single member gene moved most — the exact
+    "one loud gene wins" failure mode that ``differential_expression``'s
+    predecessor suffered from on the encoder side. Testing against the
+    rest of the panel asks whether the pathway *as a whole* stands out,
+    which is what a real pathway signal looks like.
+
+    This function never sees the model. It operates purely on the DE
+    table and the adjacency, so it's the model-agnostic baseline against
+    which model-based pathway rankings should be compared. If the model's
+    ranking doesn't beat this one, the model isn't adding pathway-level
+    information.
+
+    Parameters
+    ----------
+    de : pandas.DataFrame
+        A per-gene DE table with at least the ``statistic`` column.
+        Typically the output of ``differential_expression``. Its index
+        should be gene names when ``adj`` is a DataFrame indexed by gene
+        names — the two are aligned by name in that case. If both are
+        integer-indexed, positional alignment is used and the caller is
+        responsible for matching gene order.
+    adj : torch.Tensor, numpy.ndarray, or pandas.DataFrame
+        Binary gene-to-pathway adjacency of shape (n_genes, n_pathways).
+        When a DataFrame, its index is gene names and columns are pathway
+        names — both are used for alignment and in the returned DataFrame.
+    statistic : str, default "lfc_mean"
+        Column of ``de`` to use as the per-gene effect. Common choices:
+        "lfc_mean" (the mean log2 fold change), "bf" (the log Bayes
+        factor), or any other numeric column in ``de``.
+    min_genes : int, default 5
+        Pathways with fewer than this many member genes (after removing
+        NaN statistic values) are skipped. Their row appears in the
+        output with NaN pvalue and qvalue. Small pathways are too noisy
+        for Mann-Whitney to say anything reliable.
+    center : bool, default True
+        When True, subtract the median of the statistic across all genes
+        before running any test. This matters when the DE statistic comes
+        from a compositional decoder (softmax over genes): one strongly
+        induced gene mechanically depresses every other gene, and a
+        genuinely up-regulated pathway can then have a negative raw
+        median without the centering. Turn off only if you already know
+        the panel-wide median is meaningful zero.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per pathway, indexed by pathway name. Sorted by ``qvalue``
+        ascending, then ``|effect|`` descending. Columns:
+
+        - ``n_genes`` : number of annotated member genes for this pathway.
+        - ``n_tested`` : members with a finite statistic value (subject to
+          ``min_genes``).
+        - ``median_member`` : median of the statistic across members.
+        - ``median_reference`` : median of the statistic across non-members.
+        - ``effect`` : ``median_member - median_reference``. Sign
+          convention: positive means members are higher than the panel;
+          negative means members are lower.
+        - ``pvalue`` : two-sided Mann-Whitney p-value for the null that
+          member and non-member statistics have the same distribution.
+        - ``qvalue`` : Benjamini-Hochberg FDR-adjusted p-value over all
+          tested pathways. Skipped pathways contribute NaN and do not
+          inflate the adjustment burden.
+        - ``sign`` : +1 if effect > 0, -1 if effect < 0, 0 otherwise.
+
+    Raises
+    ------
+    ValueError
+        If ``statistic`` is not a column of ``de``, or ``adj`` shape
+        doesn't match ``de`` length.
+
+    Notes
+    -----
+    Named indices are the safest way to pass ``de`` and ``adj`` here.
+    ``differential_expression`` sorts its output by ``proba_de`` desc,
+    so passing that sorted DataFrame with a gene-name index and an
+    ``adj`` DataFrame with gene-name index does the right thing (they
+    align by name, order doesn't matter). Passing bare arrays or
+    integer-indexed DataFrames does positional alignment — the caller
+    then owns keeping gene order consistent.
+
+    Median-based effect and Mann-Whitney U were chosen together for
+    robustness to outliers on both sides. If the mean were used for
+    ``effect``, one huge member gene would drag the effect toward its
+    sign regardless of how the other members behaved — the same failure
+    mode this function exists to sidestep.
+    """
+    import numpy as np
+    import pandas as pd
+    import torch
+    from scipy import stats
+
+    # --- Coerce adj to (values, pathway_names, gene_names) ---
+    if isinstance(adj, pd.DataFrame):
+        pathway_names = list(adj.columns)
+        adj_gene_names = list(adj.index)
+        adj_arr = adj.values
+    elif isinstance(adj, np.ndarray):
+        adj_arr = adj
+        pathway_names = [f"pathway_{j}" for j in range(adj.shape[1])]
+        adj_gene_names = None
+    elif isinstance(adj, torch.Tensor):
+        adj_arr = adj.detach().cpu().numpy()
+        pathway_names = [f"pathway_{j}" for j in range(adj.shape[1])]
+        adj_gene_names = None
+    else:
+        raise TypeError(
+            f"adj must be pandas.DataFrame, numpy.ndarray or torch.Tensor; "
+            f"got {type(adj).__name__}"
+        )
+    adj_arr = np.asarray(adj_arr, dtype=np.float32)
+
+    # --- Validate statistic column ---
+    if statistic not in de.columns:
+        raise ValueError(
+            f"statistic={statistic!r} is not a column of `de`. "
+            f"Available: {list(de.columns)}"
+        )
+
+    # --- Align de to adj's gene axis ---
+    if adj_gene_names is not None and not isinstance(de.index, pd.RangeIndex):
+        # Both named: align by name. This is the safe path.
+        de_aligned = de.reindex(adj_gene_names)
+        # Refuse silently-invalid alignment: if adj references genes de doesn't
+        # have, reindex fills them with NaN — potentially many, changing the test.
+        n_new_na = de_aligned[statistic].isna().sum() - de[statistic].isna().sum()
+        if n_new_na > 0:
+            missing = set(adj_gene_names) - set(de.index)
+            raise ValueError(
+                f"adj references {len(missing)} gene(s) not in `de`: "
+                f"e.g. {sorted(missing)[:5]}"
+            )
+    else:
+        # Positional alignment. Caller owns gene order.
+        if len(de) != adj_arr.shape[0]:
+            raise ValueError(
+                f"de has {len(de)} genes but adj has {adj_arr.shape[0]}. "
+                f"When indices don't match by name, positional alignment "
+                f"requires equal lengths."
+            )
+        de_aligned = de
+
+    stat_values = de_aligned[statistic].to_numpy(dtype=np.float64, copy=True)
+    n_genes, n_pathways = adj_arr.shape
+
+    # --- Optional median centering (compositional-decoder fix) ---
+    finite = np.isfinite(stat_values)
+    if center and finite.any():
+        panel_median = np.median(stat_values[finite])
+        stat_values = stat_values - panel_median
+        finite = np.isfinite(stat_values)  # panel_median finite, so still valid
+
+    # --- Per-pathway competitive Mann-Whitney ---
+    n_genes_per_pathway = adj_arr.sum(axis=0).astype(int)
+    median_member = np.full(n_pathways, np.nan, dtype=np.float64)
+    median_reference = np.full(n_pathways, np.nan, dtype=np.float64)
+    effect = np.full(n_pathways, np.nan, dtype=np.float64)
+    pvalue = np.full(n_pathways, np.nan, dtype=np.float64)
+    n_tested = np.zeros(n_pathways, dtype=np.int64)
+
+    for j in range(n_pathways):
+        member_mask = adj_arr[:, j].astype(bool)
+        m_vals = stat_values[member_mask & finite]
+        r_vals = stat_values[(~member_mask) & finite]
+        n_tested[j] = len(m_vals)
+
+        if len(m_vals) < min_genes:
+            continue
+        if len(r_vals) == 0:
+            # Degenerate: pathway includes every gene in the panel.
+            continue
+
+        median_member[j] = float(np.median(m_vals))
+        median_reference[j] = float(np.median(r_vals))
+        effect[j] = median_member[j] - median_reference[j]
+
+        # Two-sided Mann-Whitney U.
+        try:
+            _u, p = stats.mannwhitneyu(m_vals, r_vals, alternative="two-sided")
+            pvalue[j] = float(p)
+        except ValueError:
+            # scipy raises when both sides are identical constants. Leave
+            # pvalue NaN — the pathway is uninformative.
+            pass
+
+    # --- BH-adjusted q-values ---
+    qvalue = _benjamini_hochberg(pvalue)
+
+    sign = np.where(
+        np.isnan(effect),
+        0,
+        np.where(effect > 0, 1, np.where(effect < 0, -1, 0)),
+    ).astype(int)
+
+    df = pd.DataFrame(
+        {
+            "n_genes": n_genes_per_pathway,
+            "n_tested": n_tested,
+            "median_member": median_member,
+            "median_reference": median_reference,
+            "effect": effect,
+            "pvalue": pvalue,
+            "qvalue": qvalue,
+            "sign": sign,
+        },
+        index=pd.Index(pathway_names, name="pathway"),
+    )
+
+    # Sort by qvalue asc, then |effect| desc — same tie-breaking pattern
+    # as differential_expression. NaN qvalues sort to the bottom.
+    df = df.assign(_abs_effect=lambda d: d["effect"].abs())
+    df = df.sort_values(
+        by=["qvalue", "_abs_effect"],
+        ascending=[True, False],
+        kind="mergesort",
+        na_position="last",
+    ).drop(columns="_abs_effect")
+
+    return df
+
+

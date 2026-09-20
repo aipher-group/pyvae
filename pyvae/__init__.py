@@ -9,6 +9,7 @@ from pyvae.interpret import (
     bayes_factor_da,
     differential_expression,
     integrated_gradients,
+    pathway_activity,
     pathway_unit_fidelity,
 )
 from pyvae.layers import InformedLinear
@@ -30,5 +31,6 @@ __all__ = [
     "bayes_factor_da",
     "differential_expression",
     "integrated_gradients",
+    "pathway_activity",
     "pathway_unit_fidelity",
 ]
