@@ -1,0 +1,11 @@
+interferon_ab_rank,interferon_parent_rank,interferon_induction_rank,top_20_hit_rate,sample_fraction,method,n_val
+1.0,2.0,143.0,0.1,1.0,naive,4935
+1.0,2.0,233.0,0.15,1.0,model,4935
+1.0,2.0,110.0,0.1,0.5,naive,2467
+1.0,2.0,220.0,0.15,0.5,model,2467
+1.0,2.0,387.0,0.1,0.25,naive,1233
+1.0,2.0,250.0,0.15,0.25,model,1233
+1.0,2.0,196.0,0.1,0.1,naive,493
+1.0,2.0,376.0,0.15,0.1,model,493
+1.0,3.0,92.0,0.1,0.05,naive,246
+1.0,2.0,151.0,0.15,0.05,model,246

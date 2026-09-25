@@ -1,0 +1,9 @@
+{
+  "best_val_loss": 330.1043899304236,
+  "tanh_saturation": 9.134224819717929e-05,
+  "competitive_z_interferon": 6.00113297160905,
+  "sign_agreement": 0.47784431137724553,
+  "counterfactual_correlation": 0.5523295402526855,
+  "n_epochs_run": 100,
+  "train_time_s": 4934.159747838974
+}

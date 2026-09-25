@@ -1,18 +1,33 @@
+"""Components — helpers, encoder, decoders, likelihoods.
+
+This module holds:
+
+- Small utility functions: ``reparameterise``, ``gaussian_kl``, ``nb_log_prob``,
+  ``nb_reconstruction_loss``, ``as_float_tensor``, ``_make_dec_out``.
+- The ``Encoder`` module.
+- The two decoder modules: ``DenseDecoder`` (Gaussian likelihood) and
+  ``CountDecoder`` (NB likelihood).
+- The ``GaussianLikelihood`` module.
+
+Phase 1c additions:
+
+- ``as_float_tensor`` coerces torch / numpy / pandas / scipy-sparse inputs
+  to a float32 tensor, raising a TypeError that names the offending argument.
+  Fixes the previous silent restriction where the trainers called ``.values``
+  on inputs, which quietly assumed pandas.
+- ``_make_dec_out`` returns either an ``nn.Linear`` (dense decoder) or an
+  ``InformedLinear`` (masked decoder, gated by the ``informed_decoder`` flag
+  on ``InformedVAE``). The masked decoder deliberately uses ``mask_bias=False``
+  so every gene keeps a free per-gene baseline, even those with no pathway
+  annotation.
+- ``Encoder`` now threads ``init``, ``normalize``, ``nonneg``, and
+  ``standardize_input`` through to its ``InformedLinear``.
+- ``DenseDecoder`` and ``CountDecoder`` now accept ``adj`` and ``init`` to
+  route through ``_make_dec_out``.
+
+Every new option defaults to the pre-existing behaviour, so the golden
+regression test still passes bit-for-bit.
 """
-Shared building blocks for the informed VAE.
-
-Splits the model into reusable pieces so the classic model and later variants
-are assembled from the same parts instead of duplicating code:
-
-    Encoder            genes -> pathway activations h -> (mu, log_var)
-    reparameterise     (mu, log_var) -> sampled latent z
-    DenseDecoder       z -> reconstructed genes
-    CountDecoder       z -> px_scale (proportions, softmax over genes)
-    GaussianLikelihood reconstruction loss object for the Gaussian path
-    gaussian_kl        closed-form KL( N(mu, sigma^2) || N(0, I) )
-    nb_log_prob        negative binomial log-PMF, for the count-likelihood path
-"""
-
 from __future__ import annotations
 
 import torch
@@ -22,21 +37,12 @@ import torch.nn.functional as F
 from pyvae.layers import InformedLinear
 
 
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+
 def reparameterise(mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
-    """Sample z ~ N(mu, sigma^2) with the reparameterization trick.
-
-    sigma = exp(0.5 * log_var); z = mu + sigma * eps, eps ~ N(0, I).
-    Move the body from InformedVAE.reparameterise unchanged.
-
-    Parameters
-    ----------
-    mu : (batch, latent) posterior mean.
-    log_var : (batch, latent) posterior log-variance (clamped upstream).
-
-    Returns
-    -------
-    z : (batch, latent) sampled latent, differentiable wrt mu and log_var.
-    """
     sigma = torch.exp(0.5 * log_var)
     eps = torch.randn_like(sigma)
     return mu + sigma * eps
@@ -66,32 +72,6 @@ def nb_log_prob(
     theta: torch.Tensor,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    """Elementwise log-PMF of the negative binomial distribution.
-
-    Parameterization
-    ----------------
-    Mean-dispersion form (as in scVI): ``Var(X) = mu + mu**2 / theta``.
-    Large ``theta`` -> Poisson-like; small ``theta`` -> heavily overdispersed.
-
-    Formula
-    -------
-        log p(x | mu, theta) = lgamma(x + theta) - lgamma(theta) - lgamma(x + 1)
-                             + theta * (log(theta) - log(theta + mu))
-                             + x * (log(mu) - log(theta + mu))
-
-    An ``eps`` is added inside every ``log`` to avoid ``log(0) = -inf``.
-
-    Parameters
-    ----------
-    x : (batch, n_genes) integer counts (as float tensor).
-    mu : (batch, n_genes) predicted mean, must be non-negative.
-    theta : (n_genes,) or (batch, n_genes) dispersion, must be positive.
-    eps : small constant added inside every log for numerical stability.
-
-    Returns
-    -------
-    log_prob : same shape as x, elementwise log-PMF.
-    """
     log_theta_mu_eps = torch.log(theta + mu + eps)
     return (
         torch.lgamma(x + theta)
@@ -108,52 +88,171 @@ def nb_reconstruction_loss(
     library: torch.Tensor,
     theta: torch.Tensor,
 ) -> torch.Tensor:
-    """Negative binomial reconstruction loss, summed over genes, mean over batch.
-
-    Single source of truth for ``mu = px_scale * library`` followed by
-    ``-nb_log_prob(...)``; both InformedVAE.loss and train_ivae_modern call this
-    instead of duplicating the formula.
-
-    Parameters
-    ----------
-    counts : (batch, n_genes) raw counts.
-    px_scale : (batch, n_genes) decoder output, per-cell proportions summing to 1.
-    library : (batch, 1) per-cell total count.
-    theta : (n_genes,) dispersion.
-
-    Returns
-    -------
-    loss : scalar tensor (0-dim).
-    """
     mu = px_scale * library
     return -nb_log_prob(counts, mu, theta).sum(dim=1).mean()
 
 
-class Encoder(nn.Module):
-    """Informed encoder: genes -> pathway activations h -> (mu, log_var).
+def as_float_tensor(data, name: str = "input") -> torch.Tensor:
+    """Coerce array-like input to a float32 ``torch.Tensor``.
 
-    Wraps the masked first layer (InformedLinear, tanh) and the two linear
-    heads. Reproduces InformedVAE.encode, including the clamp of log_var to
-    [-3, 3].
-
-    When ``n_cov > 0``, the encoder is conditional: a one-hot covariate matrix
-    is concatenated to the pathway activations before the mean / log-variance
-    heads. The un-concatenated pathway activations are still returned to the
-    caller (used by the L2 term and for pathway interpretation).
+    Accepts ``torch.Tensor``, ``numpy.ndarray``, ``pandas.DataFrame``,
+    ``pandas.Series``, and scipy sparse matrices. Anything else raises
+    ``TypeError`` naming the argument so the caller can locate the problem.
 
     Parameters
     ----------
-    adj : (n_genes, n_pathways) binary mask tensor.
-    latent_dim : size of the latent space.
-    n_cov : width of the auxiliary one-hot covariate. When 0 (default), the
-        encoder is unconditional and behaves exactly as before.
+    data : Any
+        The value to coerce.
+    name : str, default "input"
+        Argument name to include in the error message. Callers should pass
+        the parameter name they're validating, e.g. ``name="x"``.
+
+    Returns
+    -------
+    torch.Tensor
+        A float32 tensor. Sparse inputs are densified in memory.
+
+    Raises
+    ------
+    TypeError
+        If ``data`` is not one of the supported types. The message names
+        both the argument (``name``) and the type it received.
+
+    Notes
+    -----
+    The current trainers call ``.values`` on inputs, which works for pandas
+    but fails obscurely on a plain tensor (``Tensor.values`` resolves to a
+    bound method). This helper is the intended one-stop coercion so callers
+    do not need to know the input's provenance.
+    """
+    # Fast path: torch.Tensor. Always safe to cast to float.
+    if isinstance(data, torch.Tensor):
+        return data.float()
+
+    # numpy.ndarray. Lazy import so this module works without numpy present.
+    try:
+        import numpy as np
+        if isinstance(data, np.ndarray):
+            return torch.from_numpy(data.astype(np.float32, copy=False))
+    except ImportError:
+        pass
+
+    # pandas.DataFrame / Series.
+    try:
+        import pandas as pd
+        if isinstance(data, (pd.DataFrame, pd.Series)):
+            import numpy as np
+            return torch.from_numpy(data.values.astype(np.float32, copy=False))
+    except ImportError:
+        pass
+
+    # scipy sparse.
+    try:
+        from scipy import sparse
+        if sparse.issparse(data):
+            import numpy as np
+            return torch.from_numpy(data.toarray().astype(np.float32, copy=False))
+    except ImportError:
+        pass
+
+    raise TypeError(
+        f"{name} must be torch.Tensor, numpy.ndarray, pandas.DataFrame/Series, "
+        f"or scipy.sparse; got {type(data).__name__}"
+    )
+
+
+def _make_dec_out(
+    n_pathways: int,
+    n_genes: int,
+    adj: torch.Tensor | None = None,
+    init: str = "xavier",
+) -> nn.Module:
+    """Build the decoder's output layer, dense or masked.
+
+    Parameters
+    ----------
+    n_pathways : int
+        Input dimensionality (the pathway-layer width of the decoder).
+    n_genes : int
+        Output dimensionality (number of genes to predict).
+    adj : torch.Tensor or None, default None
+        Adjacency of shape ``(n_genes, n_pathways)``. When ``None``, returns
+        a dense ``nn.Linear(n_pathways, n_genes)``. When provided, returns an
+        ``InformedLinear(adj.T, ...)`` so each pathway's output only affects
+        its member genes.
+    init : {"xavier", "fan_in"}, default "xavier"
+        Weight initialisation for the masked variant. Ignored when ``adj`` is
+        None (nn.Linear uses PyTorch's default kaiming_uniform_).
+
+    Returns
+    -------
+    nn.Module
+        Either ``nn.Linear`` or ``InformedLinear`` matching the two cases above.
+
+    Raises
+    ------
+    ValueError
+        If ``adj`` is provided but does not have shape ``(n_genes, n_pathways)``.
+
+    Notes
+    -----
+    ``mask_bias=False`` on the masked variant is deliberate: the bias here
+    is a per-gene baseline expression level and must stay free even for a
+    gene with no annotations, which would otherwise sit at zero logit
+    forever. Only the weight matrix is masked, not the bias.
+    """
+    if adj is None:
+        return nn.Linear(n_pathways, n_genes)
+
+    if adj.shape != (n_genes, n_pathways):
+        raise ValueError(
+            f"adj must have shape ({n_genes}, {n_pathways}); got {tuple(adj.shape)}"
+        )
+
+    return InformedLinear(
+        adj.T,
+        activation="linear",
+        init=init,
+        mask_bias=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Encoder
+# ---------------------------------------------------------------------------
+
+
+class Encoder(nn.Module):
+    """Masked linear encoder followed by two dense heads for mu and log_var.
+
+    The masked layer is an :class:`InformedLinear`; Phase 1c added keyword-only
+    parameters that let ``InformedVAE`` pass through the four encoder-side
+    constraint options (``init``, ``normalize``, ``nonneg``, ``standardize_input``).
+    Every option defaults to the pre-existing behaviour.
     """
 
-    def __init__(self, adj: torch.Tensor, latent_dim: int, n_cov: int = 0):
+    def __init__(
+        self,
+        adj: torch.Tensor,
+        latent_dim: int,
+        n_cov: int = 0,
+        *,
+        init: str = "xavier",
+        normalize: str = "none",
+        nonneg: bool = False,
+        standardize_input: bool = False,
+    ):
         super().__init__()
         n_pathways = adj.shape[1]
         self.n_cov = n_cov
-        self.informed = InformedLinear(adj, activation="tanh")
+        self.informed = InformedLinear(
+            adj,
+            activation="tanh",
+            init=init,
+            normalize=normalize,
+            nonneg=nonneg,
+            standardize_input=standardize_input,
+        )
         if n_cov > 0:
             self.fc_mean = nn.Linear(n_pathways + n_cov, latent_dim)
             self.fc_log_var = nn.Linear(n_pathways + n_cov, latent_dim)
@@ -164,21 +263,6 @@ class Encoder(nn.Module):
     def forward(
         self, x: torch.Tensor, cov: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Encode a batch of expression, optionally conditioned on covariates.
-
-        Parameters
-        ----------
-        x : (batch, n_genes) log1p-normalized expression.
-        cov : (batch, n_cov) one-hot covariates. Required iff n_cov > 0.
-
-        Returns
-        -------
-        mu : (batch, latent) posterior mean.
-        log_var : (batch, latent) posterior log-variance, clamped to [-3, 3].
-        h : (batch, n_pathways) RAW pathway activations (NOT concatenated with
-            cov). Same shape and meaning as before this issue; used by the L2
-            term and for pathway interpretation.
-        """
         h = self.informed(x)
         if self.n_cov > 0:
             if cov is None:
@@ -195,47 +279,41 @@ class Encoder(nn.Module):
         return mu, log_var, h
 
 
+# ---------------------------------------------------------------------------
+# Decoders
+# ---------------------------------------------------------------------------
+
+
 class DenseDecoder(nn.Module):
-    """Dense decoder: latent -> pathways (tanh) -> genes.
+    """Decoder for the Gaussian likelihood.
 
-    Reproduces InformedVAE.decode (dec_latent + dec_out).
-
-    When ``n_cov > 0``, the decoder is conditional: a covariate term
-    ``cov_decoder(cov)`` is added directly to the reconstructed gene values.
-    There is no softmax on this decoder, so no ordering issue: the covariate
-    term is simply an additive shift on the output.
-
-    Parameters
-    ----------
-    latent_dim : size of the latent space.
-    n_pathways : width of the hidden pathway layer.
-    n_genes : number of output genes.
-    n_cov : width of the auxiliary one-hot covariate. When 0 (default), the
-        decoder is unconditional and behaves exactly as before.
+    Phase 1c added the ``adj`` and ``init`` keyword-only parameters. When
+    ``adj`` is provided (i.e. ``InformedVAE(informed_decoder=True)`` at the
+    model level), the ``dec_out`` layer is masked so each pathway output
+    only affects its member genes. Otherwise ``dec_out`` remains a dense
+    ``nn.Linear`` and current behaviour is reproduced exactly.
     """
 
-    def __init__(self, latent_dim: int, n_pathways: int, n_genes: int, n_cov: int = 0):
+    def __init__(
+        self,
+        latent_dim: int,
+        n_pathways: int,
+        n_genes: int,
+        n_cov: int = 0,
+        *,
+        adj: torch.Tensor | None = None,
+        init: str = "xavier",
+    ):
         super().__init__()
         self.n_cov = n_cov
         self.dec_latent = nn.Linear(latent_dim, n_pathways)
-        self.dec_out = nn.Linear(n_pathways, n_genes)
+        self.dec_out = _make_dec_out(n_pathways, n_genes, adj, init)
         if n_cov > 0:
             # No bias: the per-gene baseline is provided by dec_out's bias;
             # this layer should only capture the shift due to the label.
             self.cov_decoder = nn.Linear(n_cov, n_genes, bias=False)
 
     def forward(self, z: torch.Tensor, cov: torch.Tensor | None = None) -> torch.Tensor:
-        """Decode latent samples back to gene space.
-
-        Parameters
-        ----------
-        z : (batch, latent) latent samples.
-        cov : (batch, n_cov) one-hot covariates. Required iff n_cov > 0.
-
-        Returns
-        -------
-        recon : (batch, n_genes) reconstructed expression.
-        """
         h_prime = torch.tanh(self.dec_latent(z))
         x_hat = self.dec_out(h_prime)
         if self.n_cov > 0:
@@ -250,37 +328,29 @@ class DenseDecoder(nn.Module):
 
 
 class CountDecoder(nn.Module):
-    """Count decoder: latent -> pathways (tanh) -> gene logits -> softmax proportions.
+    """Decoder for the negative-binomial likelihood.
 
-    Produces ``px_scale``, the per-cell gene expression proportions summing to 1
-    across the gene axis. The mean of the negative binomial (``mu = px_scale *
-    library``) is computed downstream in ``InformedVAE.loss`` where the per-cell
-    library size is available.
-
-    A learnable per-gene log-dispersion ``px_r`` is stored on the module; its
-    exponential (always positive) is exposed as ``theta`` for the NB likelihood.
-
-    When ``n_cov > 0``, the decoder is conditional: a covariate term
-    ``cov_decoder(cov)`` is added to the gene logits BEFORE the softmax. This
-    ordering matters. Adding the covariate before softmax means the label
-    shifts genes' log-proportions relative to each other (the standard way
-    scVI/scGen and other conditional generative single-cell models work).
-    Adding it after softmax would break the "proportions sum to 1" property.
-
-    Parameters
-    ----------
-    latent_dim : size of the latent space.
-    n_pathways : width of the hidden pathway layer.
-    n_genes : number of output genes.
-    n_cov : width of the auxiliary one-hot covariate. When 0 (default), the
-        decoder is unconditional and behaves exactly as before.
+    Phase 1c added the ``adj`` and ``init`` keyword-only parameters. When
+    ``adj`` is provided, the ``dec_out`` layer that produces logits is masked
+    so each pathway output only affects its member genes' logits. Softmax
+    is applied on the (batched) logit vector as before; the mask does not
+    change the softmax's normalisation.
     """
 
-    def __init__(self, latent_dim: int, n_pathways: int, n_genes: int, n_cov: int = 0):
+    def __init__(
+        self,
+        latent_dim: int,
+        n_pathways: int,
+        n_genes: int,
+        n_cov: int = 0,
+        *,
+        adj: torch.Tensor | None = None,
+        init: str = "xavier",
+    ):
         super().__init__()
         self.n_cov = n_cov
         self.dec_latent = nn.Linear(latent_dim, n_pathways)
-        self.dec_out = nn.Linear(n_pathways, n_genes)
+        self.dec_out = _make_dec_out(n_pathways, n_genes, adj, init)
         if n_cov > 0:
             # No bias: the per-gene baseline is provided by dec_out's bias;
             # this layer should only capture the shift due to the label.
@@ -289,18 +359,6 @@ class CountDecoder(nn.Module):
         self.px_r = nn.Parameter(torch.zeros(n_genes))
 
     def forward(self, z: torch.Tensor, cov: torch.Tensor | None = None) -> torch.Tensor:
-        """Decode latent samples to per-cell gene proportions.
-
-        Parameters
-        ----------
-        z : (batch, latent) latent samples.
-        cov : (batch, n_cov) one-hot covariates. Required iff n_cov > 0.
-
-        Returns
-        -------
-        px_scale : (batch, n_genes) softmax proportions, one row per cell,
-            summing to 1 across the gene axis.
-        """
         h_prime = torch.tanh(self.dec_latent(z))
         logits = self.dec_out(h_prime)
         if self.n_cov > 0:
@@ -320,15 +378,6 @@ class CountDecoder(nn.Module):
 
 
 class GaussianLikelihood(nn.Module):
-    """Reconstruction loss object (MSE), so the loss term is swappable later.
-
-    Wraps the reconstruction term in InformedVAE.loss:
-        F.mse_loss(recon, x, reduction="none").sum(dim=1).mean()
-
-    Keeping it as an object lets a future count likelihood (NB/ZINB) drop in
-    without touching the model assembly.
-    """
-
     def __call__(self, recon: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         """Reconstruction loss for a batch.
 

@@ -38,6 +38,8 @@ def test_train_ivae_modern_signature_contract():
         "x_val",
         "x_counts_train",
         "x_counts_val",
+        "cov_train",
+        "cov_val",
         "epochs",
         "batch_size",
         "patience",

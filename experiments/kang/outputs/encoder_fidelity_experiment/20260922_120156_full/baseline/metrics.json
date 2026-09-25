@@ -1,0 +1,11 @@
+{
+  "best_val_loss": 330.1043899304236,
+  "fidelity_median_abs_corr": 0.21395131945610046,
+  "fidelity_fraction_below_02": 0.47619047619047616,
+  "fidelity_fraction_inverted": 0.15046439628482972,
+  "unit_vs_naive_auc_diff_mean": -0.00011138594806854002,
+  "unit_vs_naive_auc_frac_wins": 0.5744822979291917,
+  "competitive_z_interferon": 6.00113297160905,
+  "n_epochs_run": 100,
+  "train_time_s": 1731.2973868846893
+}
