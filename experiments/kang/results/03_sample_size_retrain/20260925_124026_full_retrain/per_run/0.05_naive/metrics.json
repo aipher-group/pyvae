@@ -1,0 +1,10 @@
+{
+  "interferon_ab_rank": 1.0,
+  "interferon_parent_rank": 2.0,
+  "interferon_induction_rank": 143.0,
+  "top_20_hit_rate": 0.1,
+  "sample_fraction": 0.05,
+  "method": "naive",
+  "n_train": 986,
+  "train_time_s": 403.8658130168915
+}
