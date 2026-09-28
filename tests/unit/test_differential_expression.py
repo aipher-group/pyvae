@@ -229,28 +229,63 @@ class TestReproducibility:
 # ---------- min_detection filter ----------
 
 
-class TestMinDetection:
-    def test_default_detection_rate_is_one_when_no_zeros(self):
-        """With min_detection=0 and softmax outputs (always > 0), detection is 1."""
-        model = make_nb_model()
-        x_a = make_random_cells()
-        x_b = make_random_cells(seed=1)
-        df = differential_expression(model, x_a, x_b, n_samples=2, n_pairs=100, seed=42)
-        # softmax outputs are always > 0 (eps guards), so with min_detection=0
-        # every pair contributes to detection.
-        assert (df["detection_rate"] == 1.0).all()
+def _cells_with_sparse_genes(n_cells: int = 40, seed: int = 0) -> torch.Tensor:
+    """Random cells where gene 0 is seen in 10% of cells and gene 1 in 50%.
 
-    def test_high_min_detection_drops_detection_rate(self):
-        """A stringent min_detection reduces detection_rate below 1."""
+    detection_rate is a property of the observed matrix, so a fixture that
+    exercises it has to contain zeros. The previous fixture was all-positive,
+    which is why the old assertions could only ever probe the decoder.
+    """
+    g = torch.Generator().manual_seed(seed)
+    x = torch.rand(n_cells, N_GENES, generator=g) + 0.1
+    x[:, 0] = 0.0
+    x[: n_cells // 10, 0] = 1.0          # 10% detection
+    x[:, 1] = 0.0
+    x[: n_cells // 2, 1] = 1.0           # 50% detection
+    return x
+
+
+class TestMinDetection:
+    def test_detection_rate_is_the_observed_nonzero_fraction(self):
+        """detection_rate comes from x_a/x_b, not from the decoder.
+
+        Thresholding the decoder's own px_scale cannot catch the case this
+        parameter exists for, since a barely observed gene still gets a
+        confident proportion and so passes its own threshold. The two scales
+        also differ by orders of magnitude: proportions over thousands of genes
+        average ~1e-4, so a cell-fraction threshold like 0.01 would have
+        flagged every gene.
+        """
         model = make_nb_model()
-        x_a = make_random_cells()
-        x_b = make_random_cells(seed=1)
+        x_a = _cells_with_sparse_genes(seed=0)
+        x_b = _cells_with_sparse_genes(seed=1)
+        df = differential_expression(model, x_a, x_b, n_samples=2, n_pairs=100, seed=42)
+        assert df["detection_rate"].loc[0] == pytest.approx(0.10)
+        assert df["detection_rate"].loc[1] == pytest.approx(0.50)
+        assert (df["detection_rate"].drop(index=[0, 1]) == 1.0).all()
+        assert len(df) == N_GENES, "min_detection=0 must keep every gene"
+
+    def test_min_detection_drops_barely_observed_genes(self):
+        model = make_nb_model()
+        x_a = _cells_with_sparse_genes(seed=0)
+        x_b = _cells_with_sparse_genes(seed=1)
         df = differential_expression(
             model, x_a, x_b, n_samples=2, n_pairs=100, seed=42,
-            min_detection=0.15,  # softmax over 8 genes averages ~0.125
+            min_detection=0.25,
         )
-        # At least some genes should have detection_rate < 1 with min_detection > 1/N_GENES.
-        assert (df["detection_rate"] < 1.0).any()
+        assert 0 not in df.index, "the 10%-detection gene must be dropped"
+        assert 1 in df.index, "the 50%-detection gene must survive"
+        assert len(df) == N_GENES - 1
+
+    def test_min_detection_raises_when_it_removes_everything(self):
+        model = make_nb_model()
+        x_a = _cells_with_sparse_genes(seed=0)
+        x_b = _cells_with_sparse_genes(seed=1)
+        with pytest.raises(ValueError, match="removed every gene"):
+            differential_expression(
+                model, x_a, x_b, n_samples=2, n_pairs=50, seed=42,
+                min_detection=1.01,
+            )
 
 
 # ---------- Covariate guards ----------

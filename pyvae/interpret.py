@@ -268,7 +268,11 @@ def pathway_unit_fidelity(
           expression of the pathway's member genes. NaN if n_genes < min_genes
           or if the unit had zero variance across cells.
         - ``abs_corr`` : absolute value of ``corr``
-        - ``sign`` : +1 if corr > 0, -1 if corr < 0, 0 if corr is NaN or 0
+        - ``sign`` : +1 if corr > 0, -1 if corr < 0, 0 if corr is exactly 0,
+          and NaN where the pathway was not tested (fewer than ``min_genes``
+          members). Untested is deliberately NOT 0: counting those rows as
+          non-inverted understates the inverted fraction badly. Aggregate with
+          ``fid.loc[fid["corr"].notna(), "sign"]`` or just ``.dropna()``.
 
     Notes
     -----
@@ -411,7 +415,12 @@ def pathway_unit_fidelity(
         corr[j] = float(np.mean(h_c * mz_c) / (h_std * mz_std))
 
     abs_corr = np.abs(corr)
-    sign = np.where(np.isnan(corr), 0, np.sign(corr)).astype(int)
+    # NaN, not 0, where the pathway was never tested. 0 asserts "the
+    # correlation is exactly zero", which is a finding; an untested pathway has
+    # no finding. Encoding both as 0 is what let a caller count 1,132 untested
+    # pathways as non-inverted and report 15.0% inverted where the tested
+    # pathways were at 50.3%. float dtype so NaN survives.
+    sign = np.where(np.isnan(corr), np.nan, np.sign(corr)).astype(float)
 
     return pd.DataFrame(
         {
@@ -495,12 +504,18 @@ def differential_expression(
         so a gene with a zero-decoded proportion in one cell doesn't produce
         ``inf`` in the log ratio.
     min_detection : float, default 0.0
-        Optional threshold on decoded proportions. A pair contributes to the
-        ``detection_rate`` count for a gene iff both cells' decoded proportion
-        for that gene exceeds ``min_detection``. A gene where
-        ``detection_rate`` is much less than 1 has its ``lfc_mean`` and
-        ``proba_de`` computed on very few real pairs — usually a sign to
-        exclude it from downstream analysis.
+        Drop genes whose OBSERVED detection rate, the fraction of cells with
+        non-zero counts taken as the better of the two groups, is below this.
+        0.0 keeps every gene.
+
+        Raise it when the top of the ranking fills with barely observed genes.
+        A gene present in a handful of cells still gets a ``px_scale`` from the
+        decoder, and that value can carry a large, highly consistent log ratio,
+        consistent enough to pin ``proba_de`` at exactly 1.0, while resting on
+        almost no data. On Kang with an informed decoder the entire unfiltered
+        top 20 sat at 0.01-3% detection while ISG15, at 60%, was rank 195.
+        ``min_detection=0.01`` is a sane starting point and the
+        ``detection_rate`` column reports what the filter acts on.
 
     Returns
     -------
@@ -522,8 +537,9 @@ def differential_expression(
         - ``lfc_std`` : standard deviation of ``log2`` fold change.
         - ``proba_up`` : fraction of samples where ``log2fc > 0``. Together
           with ``lfc_mean`` this tells you whether the gene went up in A vs B.
-        - ``detection_rate`` : fraction of samples where both cells in the
-          pair had decoded proportion above ``min_detection``.
+        - ``detection_rate`` : fraction of cells in which the gene is
+          observed non-zero, taken as the larger of the two groups. Computed
+          from ``x_a``/``x_b``, never from the decoder.
 
     Notes
     -----
@@ -621,7 +637,6 @@ def differential_expression(
     up_count = np.zeros(n_genes, dtype=np.float64)      # lfc > 0
     lfc_sum = np.zeros(n_genes, dtype=np.float64)       # sum of lfc
     lfc_sq_sum = np.zeros(n_genes, dtype=np.float64)    # sum of lfc^2 (for std)
-    det_count = np.zeros(n_genes, dtype=np.float64)     # both cells > min_detection
     total_pairs = n_samples * n_pairs
 
     sigma_a = torch.exp(0.5 * log_var_a)
@@ -651,15 +666,11 @@ def differential_expression(
 
             # Move to CPU numpy for accumulation.
             log2fc_np = log2fc.cpu().numpy()
-            px_a_np = px_a_paired.cpu().numpy()
-            px_b_np = px_b_paired.cpu().numpy()
 
             de_count += (np.abs(log2fc_np) > delta).sum(axis=0)
             up_count += (log2fc_np > 0).sum(axis=0)
             lfc_sum += log2fc_np.sum(axis=0)
             lfc_sq_sum += (log2fc_np ** 2).sum(axis=0)
-            detected = (px_a_np > min_detection) & (px_b_np > min_detection)
-            det_count += detected.sum(axis=0)
 
     # --- Compute per-gene summary statistics ---
     proba_de = de_count / total_pairs
@@ -667,7 +678,17 @@ def differential_expression(
     lfc_mean = lfc_sum / total_pairs
     lfc_var = lfc_sq_sum / total_pairs - lfc_mean ** 2
     lfc_std = np.sqrt(np.maximum(lfc_var, 0))
-    detection_rate = det_count / total_pairs
+    # Detection is a property of the OBSERVED data, not of the decoder. A gene
+    # seen in a handful of cells still gets a confident px_scale, so thresholding
+    # the decoder's own output cannot catch the case this exists for: it passes
+    # its own threshold. Take the per-gene non-zero fraction, best of the two
+    # groups. Note the scales differ by orders of magnitude, so min_detection
+    # now means "fraction of cells", where proportions over ~7,500 genes average
+    # ~1e-4 and any sane cell-fraction threshold would have flagged every gene.
+    detection_rate = np.maximum(
+        (x_a_t > 0).double().mean(dim=0).cpu().numpy(),
+        (x_b_t > 0).double().mean(dim=0).cpu().numpy(),
+    )
 
     # Clip proba_de at what the finite sample can support, per Carlos's spec:
     # 1 / (2 * total) rather than an arbitrary constant. This bounds |bf| at
@@ -697,6 +718,15 @@ def differential_expression(
         },
         index=index,
     )
+
+    if min_detection > 0.0:
+        keep = df["detection_rate"] >= min_detection
+        if not keep.any():
+            raise ValueError(
+                f"min_detection={min_detection} removed every gene; the highest "
+                f"detection rate is {df['detection_rate'].max():.4g}"
+            )
+        df = df[keep]
 
     # Sort by proba_de desc, then |lfc_mean| desc. This matters because
     # proba_de saturates at exactly 1.0 for strongly-DE genes, leaving every
@@ -774,6 +804,30 @@ def _benjamini_hochberg(pvalues):
     q = np.full(n_total, np.nan, dtype=np.float64)
     q[finite_mask] = q_finite
     return q
+
+
+def _rank_z(u: float, m_vals: np.ndarray, r_vals: np.ndarray) -> float:
+    """Signed normal-approximation z for a Mann-Whitney U, tie-corrected.
+
+    Derived from U directly, never by inverting the p-value. Round-tripping
+    through ``norm.ppf(1 - p / 2)`` silently returns ``inf`` as soon as ``p``
+    underflows to 0, which it does on a full gene panel: ``1 - 5e-301`` is
+    exactly 1.0 in float64 and ``norm.ppf(1.0)`` is ``inf``. That produced
+    ``inf`` in every row of the 02 and 04 ablations.
+
+    Positive means the pathway's member genes rank above the rest of the panel.
+    """
+    n1, n2 = len(m_vals), len(r_vals)
+    n = n1 + n2
+    if n < 2:
+        return float("nan")
+    mu = n1 * n2 / 2.0
+    _, counts = np.unique(np.concatenate([m_vals, r_vals]), return_counts=True)
+    ties = float((counts.astype(np.float64) ** 3 - counts).sum())
+    var = n1 * n2 / 12.0 * ((n + 1) - ties / (n * (n - 1)))
+    if not np.isfinite(var) or var <= 0:
+        return float("nan")
+    return float((u - mu) / np.sqrt(var))
 
 
 def pathway_activity(
@@ -856,6 +910,13 @@ def pathway_activity(
         - ``qvalue`` : Benjamini-Hochberg FDR-adjusted p-value over all
           tested pathways. Skipped pathways contribute NaN and do not
           inflate the adjustment burden.
+        - ``auc`` : ``U / (n_members * n_non_members)``, the fraction of
+          (member, non-member) pairs where the member ranks higher. 0.5 is no
+          shift; it is the common-language effect size of the same test.
+        - ``z_competitive`` : signed, tie-corrected normal-approximation z for
+          the rank test, computed from ``U`` rather than from ``pvalue``. Use
+          it instead of ``norm.ppf(1 - pvalue / 2)``, which returns ``inf``
+          once the p-value underflows to 0 on a wide gene panel.
         - ``sign`` : +1 if effect > 0, -1 if effect < 0, 0 otherwise.
 
     Raises
@@ -951,6 +1012,8 @@ def pathway_activity(
     median_reference = np.full(n_pathways, np.nan, dtype=np.float64)
     effect = np.full(n_pathways, np.nan, dtype=np.float64)
     pvalue = np.full(n_pathways, np.nan, dtype=np.float64)
+    auc = np.full(n_pathways, np.nan, dtype=np.float64)
+    z_competitive = np.full(n_pathways, np.nan, dtype=np.float64)
     n_tested = np.zeros(n_pathways, dtype=np.int64)
 
     for j in range(n_pathways):
@@ -971,8 +1034,10 @@ def pathway_activity(
 
         # Two-sided Mann-Whitney U.
         try:
-            _u, p = stats.mannwhitneyu(m_vals, r_vals, alternative="two-sided")
+            u, p = stats.mannwhitneyu(m_vals, r_vals, alternative="two-sided")
             pvalue[j] = float(p)
+            auc[j] = float(u) / (len(m_vals) * len(r_vals))
+            z_competitive[j] = _rank_z(float(u), m_vals, r_vals)
         except ValueError:
             # scipy raises when both sides are identical constants. Leave
             # pvalue NaN — the pathway is uninformative.
@@ -996,6 +1061,8 @@ def pathway_activity(
             "effect": effect,
             "pvalue": pvalue,
             "qvalue": qvalue,
+            "auc": auc,
+            "z_competitive": z_competitive,
             "sign": sign,
         },
         index=pd.Index(pathway_names, name="pathway"),

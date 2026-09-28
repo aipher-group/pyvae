@@ -128,12 +128,24 @@ def parse_args() -> argparse.Namespace:
                    default="experiments/kang/resources/c2.cp.reactome.v7.5.1.symbols.gmt")
     p.add_argument("--output-root",
                    default="experiments/kang/outputs/sample_size_experiment")
+    p.add_argument("--run-dir", default=None,
+                   help="Write results straight here instead of a timestamped "
+                        "subdirectory of --output-root. A workflow engine needs "
+                        "output paths it can predict before the job runs; a "
+                        "timestamp is by definition unpredictable, so it can "
+                        "never tell finished work from unfinished.")
 
     # Data prep
     p.add_argument("--n-genes", type=int, default=5000)
     p.add_argument("--target-sum", type=float, default=1e4)
+    p.add_argument("--reps", type=int, default=5,
+                   help="Independent subsamples per fraction. A single draw is "
+                        "noisy enough to mislead: the first pass had "
+                        "interferon_induction_rank bounce 6, 9, 6, 79 across "
+                        "adjacent fractions. summary.csv is the median over "
+                        "reps, summary_per_rep.csv keeps every draw.")
     p.add_argument("--sample-fractions", nargs="+", type=float,
-                   default=[1.0, 0.5, 0.25, 0.1, 0.05],
+                   default=[1.0, 0.5, 0.25, 0.1, 0.05, 0.025, 0.0125],
                    help="Fractions of the training set to use in retrain mode, "
                         "or of val to use in frozen mode.")
 
@@ -184,11 +196,12 @@ def parse_args() -> argparse.Namespace:
 
 def load_data(args, subsample_cells: int | None = None) -> dict:
     """Load full Kang + adjacency + covariates + 80/20 split. No subsampling here."""
-    print(f"[data] load_kang(target_sum={args.target_sum}, n_genes={args.n_genes})")
+    n_genes = args.n_genes if args.n_genes else None
+    print(f"[data] load_kang(target_sum={args.target_sum}, n_genes={n_genes})")
     adata = load_kang(
         data_folder=args.data_folder,
         normalize=True,
-        n_genes=args.n_genes,
+        n_genes=n_genes,
         return_path=False,
         target_sum=args.target_sum,
     )
@@ -442,15 +455,38 @@ def run_retrain(args, out_root: Path) -> list[dict]:
     per_run_dir = out_root / "per_run"
     per_run_dir.mkdir(parents=True, exist_ok=True)
 
-    rng = np.random.default_rng(args.seed)
-    for frac in args.sample_fractions:
+    for frac, rep in [(f, r) for f in args.sample_fractions
+                      for r in range(args.reps)]:
+        # One RNG per (fraction, rep) so draws are independent and the whole
+        # sweep still reproduces from --seed.
+        rng = np.random.default_rng(args.seed + 1000 * rep)
         n_train = int(full_train_size * frac)
         if n_train < 32:
             print(f"[retrain] frac={frac} would give n_train={n_train}, skipping")
             continue
 
-        print(f"\n[retrain] frac={frac}  n_train={n_train}")
-        train_idx = np.sort(rng.choice(full_train_size, size=n_train, replace=False))
+        print(f"\n[retrain] frac={frac}  rep={rep}  n_train={n_train}")
+        # Balanced per condition, as the reference design did. A uniform
+        # subsample lets the control/stimulated ratio drift as the fraction
+        # shrinks, so a change in ranking could come from composition rather
+        # than sample size. Sampling n_train/2 from each condition removes that
+        # confound and keeps the naive group means equally well estimated.
+        ctrl_pool = np.flatnonzero(
+            data["cov_train"][data["cond_ctrl_col"]].values > 0.5
+        )
+        stim_pool = np.flatnonzero(
+            data["cov_train"][data["cond_stim_col"]].values > 0.5
+        )
+        per_group = min(n_train // 2, len(ctrl_pool), len(stim_pool))
+        if per_group < 16:
+            print(f"[retrain] frac={frac} gives only {per_group}/group, skipping")
+            continue
+        train_idx = np.sort(np.concatenate([
+            rng.choice(ctrl_pool, size=per_group, replace=False),
+            rng.choice(stim_pool, size=per_group, replace=False),
+        ]))
+        n_train = int(len(train_idx))
+        print(f"[retrain] balanced: {per_group} control + {per_group} stimulated")
 
         subset = {
             **data,
@@ -467,18 +503,31 @@ def run_retrain(args, out_root: Path) -> list[dict]:
         print(f"  [train] {train_time:.1f}s on {n_train} cells")
 
         for method in ("naive", "model"):
-            tag = f"{frac:g}_{method}"
+            tag = f"{frac:g}_rep{rep}_{method}"
             run_dir = per_run_dir / tag
             run_dir.mkdir(exist_ok=True)
 
             if method == "naive":
+                # Naive must see the SAME cells the model was trained on. Reading
+                # data["x_val"] here handed it all 4,935 val cells at every
+                # fraction, so its row came out byte-identical across the whole
+                # sweep while the model's training set shrank 20x. That is the
+                # mirror image of the frozen-mode bias, and it makes the honest
+                # comparison this mode exists for impossible.
                 de_df, pa_df = rank_via_naive(
-                    data["x_val"], data["adj_df"], data["cov_val"],
+                    subset["x_train"], data["adj_df"], subset["cov_train"],
                     data["cond_ctrl_col"], data["cond_stim_col"], data["gene_names"],
                 )
             else:
+                # Same subsample as naive. Ranking the model on the fixed val set
+                # while naive ranks on the subsample makes the asymmetry REVERSE
+                # across the sweep: naive holds 19,738 cells against the model's
+                # 4,935 at frac=1.0, and 986 against 4,935 at frac=0.05. Both
+                # methods are then in-sample on identical cells, which is the
+                # symmetric comparison; the model's extra advantage is that it
+                # also got to train on them, and that is the thing under test.
                 de_df, pa_df = rank_via_model(
-                    model, data["x_val"], data["cov_val"], data["adj_df"],
+                    model, subset["x_train"], subset["cov_train"], data["adj_df"],
                     data["gene_names"], data["cond_ctrl_col"], data["cond_stim_col"],
                     args,
                 )
@@ -489,8 +538,11 @@ def run_retrain(args, out_root: Path) -> list[dict]:
 
             metrics = summarise_ranking(pa_df)
             metrics.update({
-                "sample_fraction": frac, "method": method,
+                "sample_fraction": frac, "rep": rep, "method": method,
                 "n_train": n_train, "train_time_s": train_time,
+                # Cells the ranking was actually computed from, so the sweep is
+                # auditable: for naive this must now shrink with the fraction.
+                "n_ranking_cells": int(len(subset["x_train"])),
             })
             with (run_dir / "metrics.json").open("w") as f:
                 json.dump(metrics, f, indent=2, default=str)
@@ -510,9 +562,12 @@ def main() -> None:
     args = parse_args()
     set_all_seeds(args.seed)
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     tag = "smoke" if args.smoke else "full"
-    out_root = Path(args.output_root) / f"{ts}_{tag}_{args.mode}"
+    if args.run_dir:
+        out_root = Path(args.run_dir)
+    else:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_root = Path(args.output_root) / f"{ts}_{tag}_{args.mode}"
     out_root.mkdir(parents=True, exist_ok=True)
     print(f"[main] output root: {out_root}")
     print(f"[main] mode: {args.mode}  fractions: {args.sample_fractions}")
@@ -532,6 +587,16 @@ def main() -> None:
 
     summary = pd.DataFrame(results)
     summary_path = out_root / "summary.csv"
+    if "rep" in summary.columns and summary["rep"].nunique() > 1:
+        # Keep every draw, but report the median per (fraction, method). A
+        # single subsample is too noisy to rank methods on; the median over
+        # reps is what the comparison should be read from.
+        summary.to_csv(out_root / "summary_per_rep.csv", index=False)
+        summary = (
+            summary.drop(columns=["rep"])
+            .groupby(["sample_fraction", "method"], as_index=False)
+            .median(numeric_only=True)
+        )
     summary.to_csv(summary_path, index=False)
     print(f"\n{'=' * 66}")
     print(f"[summary] {summary_path}")

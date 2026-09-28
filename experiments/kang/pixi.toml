@@ -1,0 +1,69 @@
+# Isolated environment for the Kang analysis.
+#
+#   cd experiments/kang && pixi install
+#   pixi run all              # the whole grid, 3 GPUs
+#   pixi run plan             # dry run, touches nothing
+#
+# Separate from the repository's own pixi project on purpose. The root project is
+# a development environment: pyvae is installed editable, so the code under test
+# is whatever happens to be in the working tree. This one pins pyvae as a built
+# dependency instead, so a run is reproducible from the lock file alone and does
+# not silently change when someone edits pyvae/.
+#
+# CUDA: pytorch 2.5.1/cuda120 matches the root project's cuda12 environment. That
+# is the newest conda-forge build that works on drivers capped at CUDA 12.4; 2.6+
+# requires cuda-version >=12.6. Check nvidia-smi's "CUDA Version" before bumping.
+
+[workspace]
+name = "kang-experiment"
+version = "0.1.0"
+# bioconda carries snakemake; conda-forge does not.
+channels = ["conda-forge", "bioconda", "pytorch", "nvidia"]
+# Named explicitly rather than via the deprecated [system-requirements] table.
+# pixi >=0.79 rewrites that table into a generated platform key on every
+# invocation, which is why the root project's pixi.lock shows up modified after
+# any pixi command and has to be checked out again before each sync. Naming the
+# platform here keeps the lock stable.
+platforms = [{ name = "linux-64-cuda-12", platform = "linux-64", cuda = "12" }]
+
+[dependencies]
+python = "3.13.*"
+pip = "*"
+pytorch = { version = "==2.5.1", build = "cuda120*" }
+numpy = ">=1.26,<3"
+pandas = ">=2.0,<3"
+scipy = ">=1.10,<2"
+scikit-learn = ">=1.7.2,<2"
+scanpy = ">=1.11,<2"
+anndata = ">=0.11.4,<0.12"
+leidenalg = ">=0.10,<1"
+python-igraph = ">=0.11.9,<2"
+pynndescent = ">=0.5.13,<0.6"
+tqdm = ">=4.66,<5"
+pyyaml = "*"
+snakemake-minimal = ">=8.20,<10"
+
+[pypi-dependencies]
+# pyvae, pinned by content rather than by whatever is in the working tree.
+#
+# The `path` form below builds a wheel from the checkout at install time, which
+# is what works while the branch is local only: a git dependency has to resolve
+# against a reachable remote, and sync.sh excludes .git/ so the GPU box has no
+# repository to resolve against either.
+#
+# Once the commit is pushed, swap the two lines. That is the only edit needed,
+# and it is what makes the environment reproducible from the lock file with no
+# checkout at all:
+#
+#   pyvae = { git = "https://github.com/aipher-group/pyvae.git", rev = "<40-char sha>" }
+#
+pyvae = { path = "../..", editable = false }
+
+[tasks]
+# Run from the repository root: every default path in the scripts is repo-root
+# relative, and the Snakefile follows that convention.
+all = { cmd = "snakemake -s experiments/kang/Snakefile -j 63 --resources gpu=3", cwd = "../.." }
+plan = { cmd = "snakemake -s experiments/kang/Snakefile -j 63 --resources gpu=3 --dry-run -q", cwd = "../.." }
+status = { cmd = "snakemake -s experiments/kang/Snakefile --summary", cwd = "../.." }
+report = { cmd = "snakemake -s experiments/kang/Snakefile --report experiments/kang/outputs/report.html", cwd = "../.." }
+unlock = { cmd = "snakemake -s experiments/kang/Snakefile --unlock", cwd = "../.." }

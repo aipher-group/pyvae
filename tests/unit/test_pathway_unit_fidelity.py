@@ -234,7 +234,13 @@ def test_n_genes_column_matches_adjacency_column_sums(synthetic_data):
 
 
 def test_pathway_below_min_genes_returns_nan_correlation():
-    """A pathway with fewer than min_genes members gets corr=NaN and sign=0."""
+    """A pathway below min_genes gets corr=NaN and sign=NaN.
+
+    sign must NOT be 0 there. 0 means "the correlation is exactly zero", which
+    is a finding, while an untested pathway has none. Conflating them let a
+    caller average sign over all 1,615 pathways and report 15.0% inverted where
+    the 483 tested ones were at 50.3%.
+    """
     adj = np.zeros((N_GENES, N_PATHWAYS), dtype=np.float32)
     adj[0:10, 0] = 1
     adj[10:20, 1] = 1
@@ -254,7 +260,11 @@ def test_pathway_below_min_genes_returns_nan_correlation():
     fid = pathway_unit_fidelity(model, x, adj_df, min_genes=10)
 
     assert np.isnan(fid.loc["p_small", "corr"])
-    assert fid.loc["p_small", "sign"] == 0
+    assert np.isnan(fid.loc["p_small", "sign"])
+    # The aggregation that used to be wrong is now safe by construction.
+    assert (fid["sign"].dropna() < 0).mean() == (
+        fid.loc[fid["corr"].notna(), "sign"] < 0
+    ).mean()
 
 
 # ---------- Guard tests ----------

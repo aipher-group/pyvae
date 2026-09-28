@@ -154,8 +154,33 @@ class TestReturnValueContract:
         assert isinstance(result, pd.DataFrame)
         assert set(result.columns) == {
             "n_genes", "n_tested", "median_member", "median_reference",
-            "effect", "pvalue", "qvalue", "sign",
+            "effect", "pvalue", "qvalue", "auc", "z_competitive", "sign",
         }
+
+    def test_z_competitive_is_finite_when_the_pvalue_underflows(self):
+        """The reason z_competitive exists.
+
+        sign(effect) * norm.ppf(1 - max(p, 1e-300) / 2) returns +/-inf as soon
+        as the rank-test p-value underflows to 0, because 1 - 5e-301 is exactly
+        1.0 in float64. On the full Kang gene panel that happened in every row
+        of the 02 and 04 ablations. Taking z from U instead cannot underflow.
+        """
+        adj = make_adj()
+        lfc = np.zeros(N_GENES)
+        lfc[0:10] = 50.0  # separation large enough to drive p to ~0
+        result = pathway_activity(make_de(lfc), adj)
+        z = result.loc["pathway_0", "z_competitive"]
+        assert np.isfinite(z), f"z_competitive must stay finite, got {z}"
+        assert z > 0, "members rank above background, so z must be positive"
+        assert result.loc["pathway_0", "auc"] == 1.0
+
+    def test_z_competitive_sign_follows_the_direction_of_change(self):
+        adj = make_adj()
+        lfc = np.zeros(N_GENES)
+        lfc[0:10] = -1.0  # pathway 0 members consistently DOWN
+        result = pathway_activity(make_de(lfc), adj)
+        assert result.loc["pathway_0", "z_competitive"] < 0
+        assert result.loc["pathway_0", "auc"] < 0.5
 
     def test_output_has_one_row_per_pathway(self):
         adj = make_adj()

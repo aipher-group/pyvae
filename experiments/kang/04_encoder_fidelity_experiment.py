@@ -74,7 +74,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import scipy.stats
 import torch
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
@@ -95,11 +94,25 @@ from pyvae import (
 # Configurations — 2x2 cross
 # ---------------------------------------------------------------------------
 
+# The first four are the 2x2 cross on a PLAIN encoder: normalize="none" and a
+# dense decoder, because build_model only forwards these kwargs and InformedVAE
+# defaults the rest. That is not the architecture the notebook ships, so the
+# last two repeat the corners of the cross under NORMALIZE="batch" +
+# INFORMED_DECODER=True. Without them the fidelity gain is only ever measured on
+# a model nobody runs.
 CONFIGS = [
     {"name": "baseline",         "kwargs": {"nonneg_encoder": False, "standardize_input": False}},
     {"name": "nonneg_only",      "kwargs": {"nonneg_encoder": True,  "standardize_input": False}},
     {"name": "standardize_only", "kwargs": {"nonneg_encoder": False, "standardize_input": True}},
     {"name": "both",             "kwargs": {"nonneg_encoder": True,  "standardize_input": True}},
+    {"name": "notebook_baseline",    "kwargs": {"nonneg_encoder": False, "standardize_input": False,
+                                                "normalize": "batch", "informed_decoder": True}},
+    {"name": "notebook_nonneg",      "kwargs": {"nonneg_encoder": True,  "standardize_input": False,
+                                                "normalize": "batch", "informed_decoder": True}},
+    {"name": "notebook_standardize", "kwargs": {"nonneg_encoder": False, "standardize_input": True,
+                                                "normalize": "batch", "informed_decoder": True}},
+    {"name": "notebook_both",        "kwargs": {"nonneg_encoder": True,  "standardize_input": True,
+                                                "normalize": "batch", "informed_decoder": True}},
 ]
 
 INTERFERON_PATHWAY = "REACTOME_INTERFERON_ALPHA_BETA_SIGNALING"
@@ -125,10 +138,19 @@ def parse_args() -> argparse.Namespace:
                    help="Path to the Reactome GMT file (matches the notebook).")
     p.add_argument("--output-root",
                    default="experiments/kang/outputs/encoder_fidelity_experiment")
+    p.add_argument("--run-dir", default=None,
+                   help="Write results straight here instead of a timestamped "
+                        "subdirectory of --output-root. A workflow engine needs "
+                        "output paths it can predict before the job runs; a "
+                        "timestamp is by definition unpredictable, so it can "
+                        "never tell finished work from unfinished.")
 
     # Data prep — same defaults as 02.
     p.add_argument("--n-cells", type=int, default=None)
-    p.add_argument("--n-genes", type=int, default=5000)
+    p.add_argument("--n-genes", type=int, default=5000,
+                   help="HVGs to keep. Pass 0 for the FULL panel (n_genes=None), "
+                        "which is what the reference run used; the 5000 default "
+                        "reproduces the first pass of this script.")
     p.add_argument("--target-sum", type=float, default=1e4)
 
     # Model
@@ -155,6 +177,14 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--save-checkpoints", action="store_true")
 
+    p.add_argument(
+        "--configs", nargs="+", default=None,
+        choices=[c["name"] for c in CONFIGS],
+        help="Run only these configs. Lets one sweep be split across several "
+             "GPUs (CUDA_VISIBLE_DEVICES=N ... --configs a b c), each writing "
+             "its own output dir; concatenate the summary.csv files afterwards.",
+    )
+
     args = p.parse_args()
 
     if args.smoke:
@@ -176,11 +206,12 @@ def parse_args() -> argparse.Namespace:
 
 def load_data(args) -> dict:
     """Load Kang + Reactome adjacency + covariates; split into train/val."""
-    print(f"[data] load_kang(target_sum={args.target_sum}, n_genes={args.n_genes})")
+    n_genes = args.n_genes if args.n_genes else None
+    print(f"[data] load_kang(target_sum={args.target_sum}, n_genes={n_genes})")
     adata = load_kang(
         data_folder=args.data_folder,
         normalize=True,
-        n_genes=args.n_genes,
+        n_genes=n_genes,
         return_path=False,
         target_sum=args.target_sum,
     )
@@ -322,10 +353,20 @@ def _summarise_fidelity(fid: pd.DataFrame) -> dict:
             "fidelity_fraction_below_02": float("nan"),
             "fidelity_fraction_inverted": float("nan"),
         }
-    # Fraction inverted: over units that were tested (corr not NaN).
-    sign = fid["sign"].dropna()
+    # Fraction inverted: over units that were TESTED only. pathway_unit_fidelity
+    # keeps sub-min_genes pathways as rows with corr=NaN and sign=0, so
+    # fid["sign"].dropna() drops nothing and the mean below would divide by
+    # every pathway instead of the tested ones. On Kang that diluted the
+    # baseline from 50.3% to 15.0%.
+    sign = fid.loc[fid["corr"].notna(), "sign"]
+    focus = (
+        float(fid.loc[INTERFERON_PATHWAY, "abs_corr"])
+        if INTERFERON_PATHWAY in fid.index else float("nan")
+    )
     return {
         "fidelity_median_abs_corr":   float(abs_corr.median()),
+        "fidelity_p90_abs_corr":      float(abs_corr.quantile(0.90)),
+        "fidelity_focus":             focus,
         "fidelity_fraction_below_02": float((abs_corr < 0.2).mean()),
         "fidelity_fraction_inverted": float((sign < 0).mean()) if len(sign) else float("nan"),
     }
@@ -402,9 +443,14 @@ def _summarise_auc_diff(auc_df: pd.DataFrame) -> dict:
             "unit_vs_naive_auc_diff_mean": float("nan"),
             "unit_vs_naive_auc_frac_wins": float("nan"),
         }
+    in_idx = INTERFERON_PATHWAY in auc_df.index
     return {
         "unit_vs_naive_auc_diff_mean": float(diff.mean()),
         "unit_vs_naive_auc_frac_wins": float((diff > 0).mean()),
+        # The focus pathway on its own. The mean over ~1,600 units can sit at a
+        # tie while the one pathway the experiment is about wins or loses badly.
+        "percell_auc_unit_focus":  float(auc_df.loc[INTERFERON_PATHWAY, "unit_auc"]) if in_idx else float("nan"),
+        "percell_auc_naive_focus": float(auc_df.loc[INTERFERON_PATHWAY, "naive_auc"]) if in_idx else float("nan"),
     }
 
 
@@ -430,17 +476,16 @@ def _compute_competitive_z_interferon(model, data, args) -> float:
         gene_names=data["gene_names"],
         seed=args.seed,
     )
-    pa = pathway_activity(de, data["adj_df"], statistic="lfc_mean")
+    pa = pathway_activity(de, data["adj_df"], statistic="lfc_mean", min_genes=10)
 
     if INTERFERON_PATHWAY not in pa.index:
         return float("nan")
-    p = pa.loc[INTERFERON_PATHWAY, "pvalue"]
-    effect = pa.loc[INTERFERON_PATHWAY, "effect"]
-    if not np.isfinite(p) or not np.isfinite(effect) or effect == 0:
+    # Signed z straight from pathway_activity; see the note in
+    # 02_architecture_ablation.py. Inverting the p-value gave inf on every row.
+    if "z_competitive" not in pa.columns:
         return float("nan")
-    p_clip = max(p, 1e-300)
-    z = scipy.stats.norm.ppf(1 - p_clip / 2)
-    return float(np.sign(effect) * z)
+    z = pa.loc[INTERFERON_PATHWAY, "z_competitive"]
+    return float(z) if np.isfinite(z) else float("nan")
 
 
 def compute_metrics(model, history, data, args, cfg_dir: Path) -> dict:
@@ -479,9 +524,12 @@ def main() -> None:
     args = parse_args()
     set_all_seeds(args.seed)
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     tag = "smoke" if args.smoke else "full"
-    out_root = Path(args.output_root) / f"{ts}_{tag}"
+    if args.run_dir:
+        out_root = Path(args.run_dir)
+    else:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_root = Path(args.output_root) / f"{ts}_{tag}"
     out_root.mkdir(parents=True, exist_ok=True)
     print(f"[main] output root: {out_root}")
     print(f"[main] mode:        {tag}")
@@ -494,7 +542,12 @@ def main() -> None:
     data = load_data(args)
 
     results = []
-    for config in CONFIGS:
+    selected = (
+        CONFIGS if not args.configs
+        else [c for c in CONFIGS if c["name"] in args.configs]
+    )
+    print(f"[main] configs:    {[c['name'] for c in selected]}")
+    for config in selected:
         name = config["name"]
         print(f"\n{'=' * 66}")
         print(f"[config] {name}  kwargs={config['kwargs']}")

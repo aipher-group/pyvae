@@ -21,9 +21,14 @@ counterfactual correlation as a comparable metric across the sweep.
 Metrics reported per config
 ---------------------------
 - best_val_loss              : minimum validation ELBO (beta=1.0) across epochs.
-- tanh_saturation            : fraction of pathway-layer activations with
-                               |h| > 0.99 on the val set. Higher = more units
-                               stuck at the tanh rails and unable to discriminate.
+- tanh_saturation            : fraction of ALL (cell, unit) activations with
+                               |h| > 0.99 on the val set. Read it with the two
+                               below, never alone: saturation is a property of
+                               the widest units, so a few pinned pathways out of
+                               ~1,600 barely move this mean.
+- sat_pathways_over_50pct    : units saturated in more than half the val cells.
+                               This is the count normalize should drive to zero.
+- sat_max                    : the worst unit's saturated fraction.
 - competitive_z_interferon   : signed z-score for the interferon-alpha/beta
                                pathway from pathway_activity on the decoder-side
                                DE table. Larger absolute value = stronger
@@ -66,7 +71,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import scipy.stats
 import torch
 from sklearn.model_selection import train_test_split
 
@@ -87,12 +91,19 @@ from pyvae import (
 # Configurations — one-at-a-time from baseline
 # ---------------------------------------------------------------------------
 
+# One-option-at-a-time rows cannot show the architecture the notebook ships,
+# which is normalize="batch" AND informed_decoder=True together. The last three
+# rows are the combinations, so the shipped config is actually measured.
 CONFIGS = [
-    {"name": "baseline",         "kwargs": {}},
-    {"name": "init_fan_in",      "kwargs": {"init": "fan_in"}},
-    {"name": "normalize_batch",  "kwargs": {"normalize": "batch"}},
-    {"name": "normalize_layer",  "kwargs": {"normalize": "layer"}},
-    {"name": "informed_decoder", "kwargs": {"informed_decoder": True}},
+    {"name": "baseline",          "kwargs": {}},
+    {"name": "init_fan_in",       "kwargs": {"init": "fan_in"}},
+    {"name": "normalize_batch",   "kwargs": {"normalize": "batch"}},
+    {"name": "normalize_layer",   "kwargs": {"normalize": "layer"}},
+    {"name": "informed_decoder",  "kwargs": {"informed_decoder": True}},
+    {"name": "fan_in+norm",       "kwargs": {"init": "fan_in", "normalize": "batch"}},
+    {"name": "norm+informed_dec", "kwargs": {"normalize": "batch", "informed_decoder": True}},
+    {"name": "all",               "kwargs": {"init": "fan_in", "normalize": "batch",
+                                             "informed_decoder": True}},
 ]
 
 INTERFERON_PATHWAY = "REACTOME_INTERFERON_ALPHA_BETA_SIGNALING"
@@ -119,13 +130,21 @@ def parse_args() -> argparse.Namespace:
                    help="Path to the Reactome GMT file (matches the notebook).")
     p.add_argument("--output-root", default="experiments/kang/outputs/architecture_ablation",
                    help="Where per-run subdirectories are created.")
+    p.add_argument("--run-dir", default=None,
+                   help="Write results straight here instead of a timestamped "
+                        "subdirectory of --output-root. A workflow engine needs "
+                        "output paths it can predict before the job runs; a "
+                        "timestamp is by definition unpredictable, so it can "
+                        "never tell finished work from unfinished.")
 
     # Data prep
     p.add_argument("--n-cells", type=int, default=None,
                    help="Subsample to N cells; None uses the full ~24k dataset.")
     p.add_argument("--n-genes", type=int, default=5000,
                    help="Top HVGs kept before pathway alignment. "
-                        "After sync_gexp_adj typically ~2400 survive.")
+                        "After sync_gexp_adj typically ~2400 survive. "
+                        "Pass 0 for the FULL panel (n_genes=None), which is "
+                        "what the reference run used.")
     p.add_argument("--target-sum", type=float, default=1e4,
                    help="load_kang target_sum (matches Phase 1e default).")
 
@@ -158,6 +177,14 @@ def parse_args() -> argparse.Namespace:
     # Outputs
     p.add_argument("--save-checkpoints", action="store_true")
 
+    p.add_argument(
+        "--configs", nargs="+", default=None,
+        choices=[c["name"] for c in CONFIGS],
+        help="Run only these configs. Lets one sweep be split across several "
+             "GPUs (CUDA_VISIBLE_DEVICES=N ... --configs a b c), each writing "
+             "its own output dir; concatenate the summary.csv files afterwards.",
+    )
+
     args = p.parse_args()
 
     # Smoke overrides
@@ -180,11 +207,12 @@ def parse_args() -> argparse.Namespace:
 
 def load_data(args) -> dict:
     """Load Kang + Reactome adjacency + covariates; split into train/val."""
-    print(f"[data] load_kang(target_sum={args.target_sum}, n_genes={args.n_genes})")
+    n_genes = args.n_genes if args.n_genes else None
+    print(f"[data] load_kang(target_sum={args.target_sum}, n_genes={n_genes})")
     adata = load_kang(
         data_folder=args.data_folder,
         normalize=True,
-        n_genes=args.n_genes,
+        n_genes=n_genes,
         return_path=False,
         target_sum=args.target_sum,
     )
@@ -322,15 +350,35 @@ def _split_val_by_condition(data: dict):
     return ctrl_mask, stim_mask
 
 
-def metric_tanh_saturation(model: InformedVAE, data: dict, args) -> float:
-    """Fraction of pathway-layer activations with |h| > 0.99 on val cells."""
+def metric_tanh_saturation(model: InformedVAE, data: dict, args) -> dict:
+    """Saturation of the pathway layer on val cells, as three numbers.
+
+    The mean over every (cell, unit) pair is the wrong summary on its own:
+    saturation is a property of the WIDEST units, and a handful of pinned
+    pathways out of ~1,600 barely move a global mean. A run reporting
+    sat_frac_all = 9e-05 can still have a unit sitting at 0.996, which is the
+    thing normalize is supposed to fix.
+
+    Returns
+    -------
+    sat_frac_all : fraction of all (cell, unit) activations with |h| > 0.99.
+    sat_pathways_over_50pct : number of units saturated in more than half of
+        the val cells. This is the count that should go to zero.
+    sat_max : the worst unit's saturated fraction.
+    """
     device = next(model.parameters()).device
     x_val_t = torch.tensor(data["x_val"].values, dtype=torch.float32, device=device)
     cov_val_t = torch.tensor(data["cov_val"].values, dtype=torch.float32, device=device)
     model.eval()
     with torch.no_grad():
         _, _, h = model.encode(x_val_t, cov_val_t)
-    return float((h.abs() > 0.99).float().mean().cpu().item())
+    sat = (h.abs() > 0.99).float()          # (n_cells, n_pathways)
+    per_unit = sat.mean(dim=0)              # (n_pathways,)
+    return {
+        "sat_frac_all": float(sat.mean().cpu().item()),
+        "sat_pathways_over_50pct": int((per_unit > 0.5).sum().cpu().item()),
+        "sat_max": float(per_unit.max().cpu().item()),
+    }
 
 
 def _run_encoder_bf(model, data, ctrl_mask, stim_mask, args) -> pd.DataFrame:
@@ -378,14 +426,14 @@ def _extract_competitive_z(pa: pd.DataFrame) -> float:
     """Signed z for INTERFERON_ALPHA_BETA_SIGNALING from pathway_activity output."""
     if pa is None or INTERFERON_PATHWAY not in pa.index:
         return float("nan")
-    p = pa.loc[INTERFERON_PATHWAY, "pvalue"]
-    effect = pa.loc[INTERFERON_PATHWAY, "effect"]
-    if not np.isfinite(p) or not np.isfinite(effect) or effect == 0:
+    # Read the signed z straight off pathway_activity. The previous route,
+    # sign(effect) * norm.ppf(1 - max(p, 1e-300) / 2), returned +/-inf in EVERY
+    # row on the full gene panel, because the rank-test p underflows to 0 and
+    # 1 - 5e-301 is exactly 1.0 in float64.
+    if "z_competitive" not in pa.columns:
         return float("nan")
-    # Clamp p to avoid inf when pvalue is exactly 0.
-    p_clip = max(p, 1e-300)
-    z = scipy.stats.norm.ppf(1 - p_clip / 2)
-    return float(np.sign(effect) * z)
+    z = pa.loc[INTERFERON_PATHWAY, "z_competitive"]
+    return float(z) if np.isfinite(z) else float("nan")
 
 
 def _compute_sign_agreement(
@@ -487,7 +535,7 @@ def compute_metrics(model, history, data, args) -> dict:
         _, pa = _run_decoder_de_pa(model, data, ctrl_mask, stim_mask, args)
 
     print("  [metric] tanh_saturation...")
-    tanh_sat = metric_tanh_saturation(model, data, args)
+    sat = metric_tanh_saturation(model, data, args)
 
     print("  [metric] competitive_z_interferon...")
     z_ifn = _extract_competitive_z(pa)
@@ -502,7 +550,9 @@ def compute_metrics(model, history, data, args) -> dict:
 
     metrics = {
         "best_val_loss":              best_val,
-        "tanh_saturation":            tanh_sat,
+        "tanh_saturation":            sat["sat_frac_all"],
+        "sat_pathways_over_50pct":    sat["sat_pathways_over_50pct"],
+        "sat_max":                    sat["sat_max"],
         "competitive_z_interferon":   z_ifn,
         "sign_agreement":             sign_agree,
         "counterfactual_correlation": cf_corr,
@@ -520,9 +570,12 @@ def main() -> None:
     args = parse_args()
     set_all_seeds(args.seed)
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     tag = "smoke" if args.smoke else "full"
-    out_root = Path(args.output_root) / f"{ts}_{tag}"
+    if args.run_dir:
+        out_root = Path(args.run_dir)
+    else:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_root = Path(args.output_root) / f"{ts}_{tag}"
     out_root.mkdir(parents=True, exist_ok=True)
     print(f"[main] output root: {out_root}")
     print(f"[main] mode:        {tag}")
@@ -537,7 +590,12 @@ def main() -> None:
     data = load_data(args)
 
     results = []
-    for config in CONFIGS:
+    selected = (
+        CONFIGS if not args.configs
+        else [c for c in CONFIGS if c["name"] in args.configs]
+    )
+    print(f"[main] configs:    {[c['name'] for c in selected]}")
+    for config in selected:
         name = config["name"]
         print(f"\n{'=' * 66}")
         print(f"[config] {name}  kwargs={config['kwargs']}")
