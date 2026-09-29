@@ -132,18 +132,16 @@ def parse_args() -> argparse.Namespace:
                    help="Fast smoke test: 500 cells, 5 epochs, small DE draws.")
 
     # Data paths — same defaults as 02_architecture_ablation.py.
-    p.add_argument("--data-folder", default="experiments/kang/data")
+    p.add_argument("--data-folder", default="data")
     p.add_argument("--resources-dir",
-                   default="experiments/kang/resources/c2.cp.reactome.v7.5.1.symbols.gmt",
+                   default="resources/c2.cp.reactome.v7.5.1.symbols.gmt",
                    help="Path to the Reactome GMT file (matches the notebook).")
     p.add_argument("--output-root",
-                   default="experiments/kang/outputs/encoder_fidelity_experiment")
+                   default="outputs/encoder_fidelity_experiment")
     p.add_argument("--run-dir", default=None,
                    help="Write results straight here instead of a timestamped "
-                        "subdirectory of --output-root. A workflow engine needs "
-                        "output paths it can predict before the job runs; a "
-                        "timestamp is by definition unpredictable, so it can "
-                        "never tell finished work from unfinished.")
+                        "subdirectory of --output-root. Snakemake needs to "
+                        "predict the output path before the job runs.")
 
     # Data prep — same defaults as 02.
     p.add_argument("--n-cells", type=int, default=None)

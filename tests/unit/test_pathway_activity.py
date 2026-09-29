@@ -155,6 +155,7 @@ class TestReturnValueContract:
         assert set(result.columns) == {
             "n_genes", "n_tested", "median_member", "median_reference",
             "effect", "pvalue", "qvalue", "auc", "z_competitive", "sign",
+            "top_gene", "top_gene_share",
         }
 
     def test_z_competitive_is_finite_when_the_pvalue_underflows(self):
@@ -279,6 +280,67 @@ class TestMinGenesFilter:
         # Big pathways still get numbers
         assert np.isfinite(result.loc["big_a", "pvalue"])
         assert np.isfinite(result.loc["big_b", "pvalue"])
+
+
+class TestTopGeneConcentration:
+    """top_gene_share names the member a pathway's score really rests on.
+
+    The competitive test resists one loud gene but cannot report which pathways
+    came close to being carried by one, so the share is worth reading alongside
+    the q-value.
+    """
+
+    def test_top_gene_is_the_largest_absolute_member(self):
+        adj = make_adj()
+        lfc = np.zeros(N_GENES)
+        lfc[0:10] = 0.2
+        lfc[7] = -5.0  # largest magnitude in pathway_0, and negative
+        result = pathway_activity(make_de(lfc), adj, min_genes=5)
+        assert result.loc["pathway_0", "top_gene"] == "gene_7"
+
+    def test_share_is_near_one_when_a_single_gene_carries_the_pathway(self):
+        adj = make_adj()
+        lfc = np.zeros(N_GENES)
+        lfc[0:10] = 0.0
+        lfc[3] = 10.0
+        result = pathway_activity(make_de(lfc), adj, min_genes=5, center=False)
+        assert result.loc["pathway_0", "top_gene"] == "gene_3"
+        assert result.loc["pathway_0", "top_gene_share"] > 0.99
+
+    def test_share_is_uniform_when_every_member_moves_equally(self):
+        adj = make_adj()
+        lfc = np.zeros(N_GENES)
+        lfc[0:10] = 1.0
+        result = pathway_activity(make_de(lfc), adj, min_genes=5, center=False)
+        assert result.loc["pathway_0", "top_gene_share"] == pytest.approx(
+            1 / 10, abs=1e-9
+        )
+
+    def test_share_is_nan_for_a_pathway_below_min_genes(self):
+        adj = np.zeros((N_GENES, 2), dtype=np.float32)
+        adj[0:10, 0] = 1
+        adj[10:12, 1] = 1  # only 2 members
+        adj_df = pd.DataFrame(
+            adj,
+            index=[f"gene_{i}" for i in range(N_GENES)],
+            columns=["big", "small"],
+        )
+        de = make_de(np.random.RandomState(0).randn(N_GENES))
+        result = pathway_activity(de, adj_df, min_genes=5)
+        assert np.isnan(result.loc["small", "top_gene_share"])
+        assert result.loc["small", "top_gene"] is None
+        assert np.isfinite(result.loc["big", "top_gene_share"])
+
+    def test_share_lies_between_uniform_and_one(self):
+        """Bounds hold for arbitrary signal on every tested pathway."""
+        adj = make_adj()
+        rng = np.random.RandomState(7)
+        result = pathway_activity(make_de(rng.randn(N_GENES)), adj, min_genes=5)
+        tested = result[result["n_tested"] >= 5]
+        assert len(tested) == N_PATHWAYS
+        for pathway, row in tested.iterrows():
+            share = row["top_gene_share"]
+            assert 1 / row["n_tested"] - 1e-9 <= share <= 1.0 + 1e-9, pathway
 
 
 # ---------- The two key Carlos-flagged invariants ----------

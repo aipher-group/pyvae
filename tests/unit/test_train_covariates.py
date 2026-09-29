@@ -228,6 +228,46 @@ class TestTrainIvaeModernWithCovariates:
 # ---------- Every matrix argument accepts torch / numpy / pandas ----------
 
 
+class TestAsFloatTensorMemoryLayout:
+    """as_float_tensor must accept views that torch.from_numpy alone rejects.
+
+    A reversed view has a negative stride, which from_numpy refuses. Handing
+    over genes or cells in reverse order is an ordinary thing to do, so every
+    layout below has to work regardless of dtype.
+    """
+
+    @pytest.mark.parametrize(
+        "make",
+        [
+            pytest.param(lambda a: a, id="c_contiguous"),
+            pytest.param(np.asfortranarray, id="fortran_order"),
+            pytest.param(lambda a: a[::-1], id="rows_reversed"),
+            pytest.param(lambda a: a[:, ::-1], id="cols_reversed"),
+            pytest.param(lambda a: a[::-1, ::-1], id="both_reversed"),
+            pytest.param(lambda a: a[::2, ::2], id="strided_slice"),
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [np.float32, np.float64])
+    def test_accepts_any_memory_layout(self, make, dtype):
+        from pyvae.components import as_float_tensor
+
+        base = np.arange(48, dtype=dtype).reshape(8, 6)
+        view = make(base)
+        out = as_float_tensor(view, name="x")
+        assert out.dtype is torch.float32
+        assert out.shape == view.shape
+        np.testing.assert_allclose(out.numpy(), np.asarray(view, dtype=np.float32))
+
+    def test_contiguous_float32_input_is_not_copied(self):
+        """The common path must stay free of a defensive copy."""
+        from pyvae.components import as_float_tensor
+
+        arr = np.ones((4, 3), dtype=np.float32)
+        out = as_float_tensor(arr, name="x")
+        arr[0, 0] = 7.0
+        assert out[0, 0].item() == 7.0, "expected a view, not a copy"
+
+
 class TestInputCoercion:
     @pytest.mark.parametrize("input_kind", ["numpy", "torch", "pandas"])
     def test_train_ivae_modern_accepts_all_input_types(self, input_kind):

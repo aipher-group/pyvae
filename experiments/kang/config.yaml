@@ -13,9 +13,11 @@
 epochs: 250          # patience is pinned to epochs so cosine annealing completes
 threads_per_job: 21  # see the Snakefile header on thread oversubscription
 n_gpus: 3
+seed: 42             # the scripts default to this; the notebook is passed it explicitly
 
-data: experiments/kang/data/kang_counts_25k.h5ad
-gmt: experiments/kang/resources/c2.cp.reactome.v7.5.1.symbols.gmt
+data: data/kang_counts_25k.h5ad
+gmt: resources/c2.cp.reactome.v7.5.1.symbols.gmt
+data_folder: data
 
 # Architecture the notebook ships. 02 and 04 vary this internally; 03 holds it
 # fixed and needs it spelled out.

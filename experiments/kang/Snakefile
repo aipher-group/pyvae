@@ -1,52 +1,39 @@
 # Kang analysis workflow.
 #
-#   pixi run -e experiment snakemake -s experiments/kang/Snakefile \
-#       -j 63 --resources gpu=3
+#   cd experiments/kang
+#   pixi run all                 # or: snakemake -j 63 --resources gpu=3
 #
-# Run it from the repository root, since every path the scripts default to is
-# repo-root relative.
+# Every path below is relative to this directory, so the workflow runs from here
+# and `snakemake` finds this file by name with no -s.
 #
-# Why a workflow engine instead of the old run_all.sh: that script carried a
-# hand-balanced lane table, a per-lane screen session, its own --status, --kill
-# and --merge verbs, and a notion of "done" that globbed for summary.csv. All of
-# it is scheduling, and Snakemake already does scheduling. What is left here is
-# the experiment grid and three commands.
-#
-# -j 63 --resources gpu=3 is the whole concurrency story, and it is two numbers
-# for two different reasons:
+# The two concurrency numbers do different jobs:
 #
 #   gpu=3 caps concurrent GPU jobs at one per card. gpu_slot.sh then hands each
 #   job an actual device via flock, because Snakemake allocates a count and not
 #   a device id.
 #
-#   -j 63 caps total threads at 63 of the 64 cores. Each job declares
-#   threads=21, so 3 x 21 saturates the box exactly once. This is not
-#   bookkeeping: three unlimited jobs each spawn one BLAS/OMP thread per core,
-#   and while training is GPU-bound and survives the oversubscription, the
-#   metrics phase is not. pathway_activity runs ~1,615 scipy rank tests per
-#   call, so it enters ~1,615 short parallel regions where oversubscribed
-#   threads spin-wait at barriers instead of working. Three concurrent jobs
-#   froze there for 5.5 hours; the identical code run alone finished in 10
-#   minutes. Raising -j past 63 re-creates that.
+#   -j 63 caps total threads at 63 of the 64 cores, and each job declares
+#   threads=21, so three jobs saturate the box exactly once. Raise it and the
+#   metrics phase stalls: pathway_activity runs ~1,615 short scipy rank tests,
+#   and oversubscribed BLAS threads spin-wait at every barrier instead of
+#   working. Training is GPU-bound and survives it; that phase does not.
 #
-# Useful invocations:
-#   --dry-run -q          what would run, touching nothing
-#   --summary             every output with its status
-#   -R <rule>             force a rule to re-run
-#   --rerun-incomplete    after a hard kill, redo jobs whose outputs are partial
-#   --report report.html  provenance: code, config and runtimes per output
+# Useful invocations, all from this directory:
+#   snakemake -n -q             what would run, touching nothing
+#   snakemake --summary         every output with its status
+#   snakemake --unlock          clear the lock left by a hard kill
+#   snakemake --rerun-incomplete    redo jobs whose outputs are half-written
+#   rm -rf outputs .snakemake   start completely from scratch
 
 import re
-from pathlib import Path
 
 
-configfile: "experiments/kang/config.yaml"
+configfile: "config.yaml"
 
 
-OUT = "experiments/kang/outputs"
+OUT = "outputs"
 LOGS = f"{OUT}/logs"
 BENCH = f"{OUT}/benchmarks"
-SRC = "experiments/kang"
 
 THREADS = config["threads_per_job"]
 EPOCHS = config["epochs"]
@@ -54,7 +41,7 @@ N_GPUS = config["n_gpus"]
 DATA = config["data"]
 GMT = config["gmt"]
 ARCH = config["arch"]
-DATA_FOLDER = str(Path(DATA).parent)
+DATA_FOLDER = config["data_folder"]
 
 ABL_CONFIGS = config["ablation_configs"]
 FID_CONFIGS = config["fidelity_configs"]
@@ -83,7 +70,7 @@ ENV = (
     "OPENBLAS_NUM_THREADS={threads} NUMEXPR_NUM_THREADS={threads} "
     "VECLIB_MAXIMUM_THREADS={threads} "
 )
-GPU = f"bash {SRC}/gpu_slot.sh"
+GPU = "bash gpu_slot.sh"
 # python -u throughout. print() is block-buffered when stdout is a file while
 # tqdm writes to stderr unbuffered, so a redirected log appears frozen at an
 # early line while the process is somewhere much later. That cost hours once.
@@ -95,6 +82,7 @@ rule all:
         f"{OUT}/02_ablation_merged.csv",
         expand(f"{OUT}/04_fidelity_e{{epochs}}.csv", epochs=FID_BUDGETS),
         f"{OUT}/03_sample_size_merged.csv",
+        f"{OUT}/01_kang_showcase.executed.ipynb",
         f"{OUT}/benchmarks.csv",
 
 
@@ -106,7 +94,7 @@ rule ablation:
     inside a set, and 8 independent jobs pack onto whichever card frees first.
     """
     input:
-        script=f"{SRC}/02_architecture_ablation.py",
+        script="02_architecture_ablation.py",
         data=DATA,
         gmt=GMT,
     output:
@@ -134,7 +122,7 @@ rule ablation:
 rule fidelity:
     """One encoder-fidelity config at one epoch budget (script 04)."""
     input:
-        script=f"{SRC}/04_encoder_fidelity_experiment.py",
+        script="04_encoder_fidelity_experiment.py",
         data=DATA,
         gmt=GMT,
     output:
@@ -165,7 +153,7 @@ rule sample_size:
     inside the run, and every rep shares one validation split.
     """
     input:
-        script=f"{SRC}/03_sample_size_experiment.py",
+        script="03_sample_size_experiment.py",
         data=DATA,
         gmt=GMT,
     output:
@@ -196,9 +184,51 @@ rule sample_size:
         " > {log} 2>&1"
 
 
+rule notebook:
+    """Execute the showcase notebook and keep the executed copy.
+
+    papermill rather than `nbconvert --execute`, though both save outputs: it
+    injects parameters into the cell tagged `parameters`, so epochs and seed come
+    from config.yaml like every other job; it writes the notebook as it goes, so
+    a job killed part way leaves the dead cell marked `status: running`; and
+    --log-output puts cell stdout in the log.
+
+    -k python3 is not optional. papermill otherwise looks for the kernel named in
+    the notebook's own metadata, which need not exist in this environment.
+
+    The notebook depends on the sample-size merge because its last figure reads
+    03_sample_size_merged.csv. It degrades gracefully when the file is absent,
+    but a full run should produce the figure rather than the fallback message.
+    """
+    input:
+        nb="01_kang_showcase.ipynb",
+        data=DATA,
+        gmt=GMT,
+        sample_size=f"{OUT}/03_sample_size_merged.csv",
+    output:
+        nb=f"{OUT}/01_kang_showcase.executed.ipynb",
+    log:
+        f"{LOGS}/notebook.log",
+    benchmark:
+        f"{BENCH}/notebook.tsv"
+    threads: THREADS
+    resources:
+        gpu=1,
+    params:
+        epochs=EPOCHS,
+        seed=config["seed"],
+    shell:
+        ENV + GPU + " papermill --no-progress-bar --log-output -k python3"
+        " -p smoke False"
+        " -p epochs {params.epochs}"
+        " -p seed {params.seed}"
+        " {input.nb} {output.nb}"
+        " > {log} 2>&1"
+
+
 # --- collection ---------------------------------------------------------------
-# These replace run_all.sh --merge. They are ordinary outputs, so they rebuild
-# when any input summary changes and are skipped when nothing has.
+# Ordinary outputs, so they rebuild when any input summary changes and are
+# skipped when nothing has.
 
 
 rule merge_ablation:
@@ -253,25 +283,23 @@ rule merge_sample_size:
         df.to_csv(output[0], index=False)
         print(f"[merge] {len(df)} rows from {len(frames)} sweeps -> {output[0]}")
 
+
 rule collect_benchmarks:
     """Gather the per-job benchmark files into one table.
 
-    Snakemake writes one TSV per job with wall time, peak RSS, peak USS and CPU
-    time. Collected here they answer two questions: what the grid costs to
-    reproduce, and whether the thread budget is right. A job whose cpu_time is
-    far below threads x wall time spent that time waiting rather than working,
-    which is the signature of the oversubscription that once froze the metrics
-    phase for 5.5 hours.
+    Answers what the grid costs to reproduce, and whether the thread budget is
+    right: a job whose cpu_time is far below threads x wall time spent it waiting
+    rather than working, which is the oversubscription the header warns about.
 
-    The benchmark files are globbed rather than declared as inputs. A job that
-    was adopted from an earlier run never executed under Snakemake, so it has no
-    benchmark, and declaring one would either fail the build or force a rerun of
-    results that already exist.
+    Benchmarks are globbed rather than declared as inputs, so a job adopted from
+    an earlier run, which has no benchmark file, neither fails the build nor
+    forces a rerun of a result that already exists.
     """
     input:
         f"{OUT}/02_ablation_merged.csv",
         expand(f"{OUT}/04_fidelity_e{{epochs}}.csv", epochs=FID_BUDGETS),
         f"{OUT}/03_sample_size_merged.csv",
+        f"{OUT}/01_kang_showcase.executed.ipynb",
     output:
         f"{OUT}/benchmarks.csv",
     run:
@@ -284,6 +312,7 @@ rule collect_benchmarks:
             len(ABL_CONFIGS)
             + len(FID_BUDGETS) * len(FID_CONFIGS)
             + len(SS_JOBS)
+            + 1  # the notebook
         )
         rows = []
         for path in sorted(glob.glob(f"{BENCH}/*.tsv")):

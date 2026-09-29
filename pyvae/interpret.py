@@ -415,11 +415,10 @@ def pathway_unit_fidelity(
         corr[j] = float(np.mean(h_c * mz_c) / (h_std * mz_std))
 
     abs_corr = np.abs(corr)
-    # NaN, not 0, where the pathway was never tested. 0 asserts "the
+    # NaN, not 0, where the pathway was never tested. Zero asserts "the
     # correlation is exactly zero", which is a finding; an untested pathway has
-    # no finding. Encoding both as 0 is what let a caller count 1,132 untested
-    # pathways as non-inverted and report 15.0% inverted where the tested
-    # pathways were at 50.3%. float dtype so NaN survives.
+    # none. Conflating the two lets a caller count untested pathways as
+    # non-inverted and badly understate the inverted rate. float so NaN survives.
     sign = np.where(np.isnan(corr), np.nan, np.sign(corr)).astype(float)
 
     return pd.DataFrame(
@@ -678,13 +677,11 @@ def differential_expression(
     lfc_mean = lfc_sum / total_pairs
     lfc_var = lfc_sq_sum / total_pairs - lfc_mean ** 2
     lfc_std = np.sqrt(np.maximum(lfc_var, 0))
-    # Detection is a property of the OBSERVED data, not of the decoder. A gene
-    # seen in a handful of cells still gets a confident px_scale, so thresholding
-    # the decoder's own output cannot catch the case this exists for: it passes
-    # its own threshold. Take the per-gene non-zero fraction, best of the two
-    # groups. Note the scales differ by orders of magnitude, so min_detection
-    # now means "fraction of cells", where proportions over ~7,500 genes average
-    # ~1e-4 and any sane cell-fraction threshold would have flagged every gene.
+    # Detection is a property of the observed data, not of the decoder: a gene
+    # seen in a handful of cells still gets a confident px_scale, so the decoder
+    # output cannot catch the case this guards against. Hence the per-gene
+    # non-zero fraction, taking whichever group detects it better. min_detection
+    # is therefore a fraction of cells, not a proportion.
     detection_rate = np.maximum(
         (x_a_t > 0).double().mean(dim=0).cpu().numpy(),
         (x_b_t > 0).double().mean(dim=0).cpu().numpy(),
@@ -918,6 +915,12 @@ def pathway_activity(
           it instead of ``norm.ppf(1 - pvalue / 2)``, which returns ``inf``
           once the p-value underflows to 0 on a wide gene panel.
         - ``sign`` : +1 if effect > 0, -1 if effect < 0, 0 otherwise.
+        - ``top_gene`` : the member gene with the largest ``|statistic|``.
+          ``None`` for pathways that were not tested.
+        - ``top_gene_share`` : that gene's share of the members' summed
+          ``|statistic|``, between ``1 / n_tested`` (every member contributes
+          equally) and 1.0 (one gene wearing a pathway's name, so read the hit
+          as a gene-level finding). NaN when the pathway was not tested.
 
     Raises
     ------
@@ -1015,10 +1018,20 @@ def pathway_activity(
     auc = np.full(n_pathways, np.nan, dtype=np.float64)
     z_competitive = np.full(n_pathways, np.nan, dtype=np.float64)
     n_tested = np.zeros(n_pathways, dtype=np.int64)
+    top_gene = np.full(n_pathways, None, dtype=object)
+    top_gene_share = np.full(n_pathways, np.nan, dtype=np.float64)
+
+    # Gene labels on the same axis as stat_values, so a pathway can name its
+    # own top member.
+    gene_labels = np.asarray(
+        adj_gene_names if adj_gene_names is not None else de_aligned.index.to_list(),
+        dtype=object,
+    )
 
     for j in range(n_pathways):
         member_mask = adj_arr[:, j].astype(bool)
-        m_vals = stat_values[member_mask & finite]
+        member_finite = member_mask & finite
+        m_vals = stat_values[member_finite]
         r_vals = stat_values[(~member_mask) & finite]
         n_tested[j] = len(m_vals)
 
@@ -1031,6 +1044,15 @@ def pathway_activity(
         median_member[j] = float(np.median(m_vals))
         median_reference[j] = float(np.median(r_vals))
         effect[j] = median_member[j] - median_reference[j]
+
+        # The competitive test resists a single loud gene but cannot report
+        # which pathways came close to being carried by one. This does.
+        abs_member = np.abs(m_vals)
+        total_abs = float(abs_member.sum())
+        if total_abs > 0:
+            top_pos = int(np.argmax(abs_member))
+            top_gene[j] = gene_labels[member_finite][top_pos]
+            top_gene_share[j] = float(abs_member[top_pos] / total_abs)
 
         # Two-sided Mann-Whitney U.
         try:
@@ -1064,6 +1086,8 @@ def pathway_activity(
             "auc": auc,
             "z_competitive": z_competitive,
             "sign": sign,
+            "top_gene": top_gene,
+            "top_gene_share": top_gene_share,
         },
         index=pd.Index(pathway_names, name="pathway"),
     )

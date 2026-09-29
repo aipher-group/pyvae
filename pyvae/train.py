@@ -304,20 +304,26 @@ def train_ivae_modern(
         )
 
     model.to(device)
+    device_t = torch.device(device)
 
-    x_train_tensor = as_float_tensor(x_train, name="x_train")
-    x_val_tensor = as_float_tensor(x_val, name="x_val")
-    x_counts_train_tensor = as_float_tensor(x_counts_train, name="x_counts_train")
-    x_counts_val_tensor = as_float_tensor(x_counts_val, name="x_counts_val")
+    # Datasets live on the device for the whole run, so a batch costs a
+    # device-side gather instead of a host-to-device copy every epoch. The trade
+    # is that train and validation must fit in device memory; the full Kang
+    # panel needs about 1.5 GB, and anything larger will OOM here rather than
+    # degrade gracefully.
+    x_train_tensor = as_float_tensor(x_train, name="x_train").to(device_t)
+    x_val_tensor = as_float_tensor(x_val, name="x_val").to(device_t)
+    x_counts_train_tensor = as_float_tensor(x_counts_train, name="x_counts_train").to(device_t)
+    x_counts_val_tensor = as_float_tensor(x_counts_val, name="x_counts_val").to(device_t)
 
     # Covariate handling. Validate up front so a shape bug fails on the first
     # tensor conversion rather than at some unclear point inside the epoch.
     if cov_train is not None:
-        cov_train_tensor = as_float_tensor(cov_train, name="cov_train")
+        cov_train_tensor = as_float_tensor(cov_train, name="cov_train").to(device_t)
     else:
         cov_train_tensor = None
     if cov_val is not None:
-        cov_val_tensor = as_float_tensor(cov_val, name="cov_val")
+        cov_val_tensor = as_float_tensor(cov_val, name="cov_val").to(device_t)
     else:
         cov_val_tensor = None
     _check_cov(model, cov_train_tensor, x_train_tensor, "cov_train")
@@ -326,19 +332,23 @@ def train_ivae_modern(
     generator = torch.Generator()
     generator.manual_seed(torch.initial_seed())
 
-    # Build datasets. When covariates are present, they are the third tensor
-    # in the tuple; the loop below unpacks accordingly.
-    if cov_train_tensor is not None:
-        train_dataset = TensorDataset(x_train_tensor, x_counts_train_tensor, cov_train_tensor)
-        val_dataset = TensorDataset(x_val_tensor, x_counts_val_tensor, cov_val_tensor)
-    else:
-        train_dataset = TensorDataset(x_train_tensor, x_counts_train_tensor)
-        val_dataset = TensorDataset(x_val_tensor, x_counts_val_tensor)
-
+    # The loaders yield row indices; the epoch loops gather the rows themselves.
+    # DataLoader is kept rather than a hand-rolled permutation because its
+    # sampler consumes `generator` purely as a function of dataset length, so
+    # the shuffle order is identical to a loader over the data tensors.
+    #
+    # Do not put the data back in the TensorDataset: per-sample indexing and
+    # collation would trade one gather per batch for a few hundred small ones.
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, generator=generator
+        TensorDataset(torch.arange(x_train_tensor.shape[0])),
+        batch_size=batch_size,
+        shuffle=True,
+        generator=generator,
     )
-    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    val_loader = DataLoader(
+        TensorDataset(torch.arange(x_val_tensor.shape[0])),
+        batch_size=batch_size,
+    )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
@@ -361,15 +371,11 @@ def train_ivae_modern(
         model.train()
         epoch_train_loss = 0.0
         n_batches = 0
-        for batch in train_loader:
-            if cov_train_tensor is not None:
-                x_batch, counts_batch, cov_batch = batch
-                cov_batch = cov_batch.to(device)
-            else:
-                x_batch, counts_batch = batch
-                cov_batch = None
-            x_batch = x_batch.to(device)
-            counts_batch = counts_batch.to(device)
+        for (idx,) in train_loader:
+            idx = idx.to(device_t, non_blocking=True)
+            x_batch = x_train_tensor[idx]
+            counts_batch = x_counts_train_tensor[idx]
+            cov_batch = cov_train_tensor[idx] if cov_train_tensor is not None else None
             library = counts_batch.sum(1, keepdim=True)
 
             optimizer.zero_grad()
@@ -399,15 +405,11 @@ def train_ivae_modern(
         val_loss_sum = 0.0
         val_recon_sum = 0.0
         with torch.no_grad():
-            for batch in val_loader:
-                if cov_val_tensor is not None:
-                    x_batch, counts_batch, cov_batch = batch
-                    cov_batch = cov_batch.to(device)
-                else:
-                    x_batch, counts_batch = batch
-                    cov_batch = None
-                x_batch = x_batch.to(device)
-                counts_batch = counts_batch.to(device)
+            for (idx,) in val_loader:
+                idx = idx.to(device_t, non_blocking=True)
+                x_batch = x_val_tensor[idx]
+                counts_batch = x_counts_val_tensor[idx]
+                cov_batch = cov_val_tensor[idx] if cov_val_tensor is not None else None
                 library = counts_batch.sum(1, keepdim=True)
 
                 recon, mu, log_var, h = model(x_batch, cov_batch)

@@ -124,18 +124,16 @@ def parse_args() -> argparse.Namespace:
                    help="Fast smoke test: 500 cells, 5 epochs, small DE draws.")
 
     # Data paths
-    p.add_argument("--data-folder", default="experiments/kang/data",
+    p.add_argument("--data-folder", default="data",
                    help="Kang h5ad cache dir.")
-    p.add_argument("--resources-dir", default="experiments/kang/resources/c2.cp.reactome.v7.5.1.symbols.gmt",
+    p.add_argument("--resources-dir", default="resources/c2.cp.reactome.v7.5.1.symbols.gmt",
                    help="Path to the Reactome GMT file (matches the notebook).")
-    p.add_argument("--output-root", default="experiments/kang/outputs/architecture_ablation",
+    p.add_argument("--output-root", default="outputs/architecture_ablation",
                    help="Where per-run subdirectories are created.")
     p.add_argument("--run-dir", default=None,
                    help="Write results straight here instead of a timestamped "
-                        "subdirectory of --output-root. A workflow engine needs "
-                        "output paths it can predict before the job runs; a "
-                        "timestamp is by definition unpredictable, so it can "
-                        "never tell finished work from unfinished.")
+                        "subdirectory of --output-root. Snakemake needs to "
+                        "predict the output path before the job runs.")
 
     # Data prep
     p.add_argument("--n-cells", type=int, default=None,
@@ -464,6 +462,15 @@ def metric_counterfactual_correlation(model, data, args) -> float:
     predict their expression under the stimulated covariate. The predicted
     mean log1p shift (across cells) is compared to the real shift
     (mean_stim - mean_ctrl in log1p space, on val cells).
+
+    Both sides of the predicted shift come from the decoder, the same cells
+    decoded once under their real covariate and once with the condition
+    swapped, so this measures the covariate effect rather than reconstruction
+    error. Differencing against the observed x_ctrl instead would leave the
+    decoder's bias in the estimate and shrink the slope toward zero.
+
+    Returns NaN when the validation split has no cells on one side of the
+    condition, or when the gene axes fail to line up.
     """
     ctrl_mask, stim_mask = _split_val_by_condition(data)
     if ctrl_mask.sum() == 0 or stim_mask.sum() == 0:
@@ -494,13 +501,20 @@ def metric_counterfactual_correlation(model, data, args) -> float:
     cov_to = swap_condition(cov_ctrl, from_label="control", to_label="stimulated")
     cov_to_t = torch.tensor(cov_to.values, dtype=torch.float32, device=device)
 
+    # Decode the same cells twice. The unswapped pass is the baseline, so the
+    # decoder's reconstruction bias sits on both sides of the difference and
+    # cancels.
+    predicted_ctrl_counts = model.predict_counterfactual(
+        x_ctrl_t, lib_ctrl_t, cov_ctrl_t, cov_ctrl_t
+    )
     predicted_stim_counts = model.predict_counterfactual(
         x_ctrl_t, lib_ctrl_t, cov_ctrl_t, cov_to_t
     )
 
-    # Predicted shift (per gene): mean over cells of log1p(pred_stim) - x_ctrl.
+    # Predicted shift (per gene), log1p space on both sides.
     predicted_shift = (
-        torch.log1p(predicted_stim_counts).mean(dim=0) - x_ctrl_t.mean(dim=0)
+        torch.log1p(predicted_stim_counts).mean(dim=0)
+        - torch.log1p(predicted_ctrl_counts).mean(dim=0)
     ).detach().cpu().numpy()
 
     # Real shift (per gene): mean over val cells: mean_stim - mean_ctrl in log1p.

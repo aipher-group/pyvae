@@ -133,7 +133,10 @@ def as_float_tensor(data, name: str = "input") -> torch.Tensor:
     try:
         import numpy as np
         if isinstance(data, np.ndarray):
-            return torch.from_numpy(data.astype(np.float32, copy=False))
+            # ascontiguousarray, not astype: from_numpy rejects negative
+            # strides, which a reversed view like x[::-1] carries. Input that
+            # is already contiguous float32 passes through without a copy.
+            return torch.from_numpy(np.ascontiguousarray(data, dtype=np.float32))
     except ImportError:
         pass
 
@@ -142,7 +145,7 @@ def as_float_tensor(data, name: str = "input") -> torch.Tensor:
         import pandas as pd
         if isinstance(data, (pd.DataFrame, pd.Series)):
             import numpy as np
-            return torch.from_numpy(data.values.astype(np.float32, copy=False))
+            return torch.from_numpy(np.ascontiguousarray(data.values, dtype=np.float32))
     except ImportError:
         pass
 

@@ -42,6 +42,15 @@ pynndescent = ">=0.5.13,<0.6"
 tqdm = ">=4.66,<5"
 pyyaml = "*"
 snakemake-minimal = ">=8.20,<10"
+# The showcase notebook runs as a workflow step. papermill executes it and keeps
+# the executed copy; ipykernel is the kernel it executes in. matplotlib, seaborn
+# and umap-learn arrive transitively through scanpy.
+papermill = ">=2.6,<3"
+ipykernel = "*"
+# regenerate.sh runs the suite as a gate before committing hours to the grid.
+# Deliberately here rather than in the root development environment: this is the
+# environment the grid actually runs in, so it is the one worth testing.
+pytest = ">=8,<10"
 
 [pypi-dependencies]
 # pyvae, pinned by content rather than by whatever is in the working tree.
@@ -60,10 +69,10 @@ snakemake-minimal = ">=8.20,<10"
 pyvae = { path = "../..", editable = false }
 
 [tasks]
-# Run from the repository root: every default path in the scripts is repo-root
-# relative, and the Snakefile follows that convention.
-all = { cmd = "snakemake -s experiments/kang/Snakefile -j 63 --resources gpu=3", cwd = "../.." }
-plan = { cmd = "snakemake -s experiments/kang/Snakefile -j 63 --resources gpu=3 --dry-run -q", cwd = "../.." }
-status = { cmd = "snakemake -s experiments/kang/Snakefile --summary", cwd = "../.." }
-report = { cmd = "snakemake -s experiments/kang/Snakefile --report experiments/kang/outputs/report.html", cwd = "../.." }
-unlock = { cmd = "snakemake -s experiments/kang/Snakefile --unlock", cwd = "../.." }
+# Every path in the Snakefile and config.yaml is relative to this directory, so
+# these run from here and `snakemake` finds the Snakefile by name.
+all = "snakemake -j 63 --resources gpu=3"
+plan = "snakemake -n -q"
+status = "snakemake --summary"
+report = "snakemake --report outputs/report.html"
+unlock = "snakemake --unlock"
