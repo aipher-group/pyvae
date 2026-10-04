@@ -1,3 +1,27 @@
+"""InformedVAE — the top-level pathway-informed variational autoencoder.
+
+Phase 1c added five keyword-only options that are threaded through to the
+encoder and (for the informed_decoder flag) the decoder:
+
+- ``init`` in {"xavier", "fan_in"} — weight initialisation for masked layers.
+- ``normalize`` in {"none", "batch", "layer"} — pre-activation standardisation
+  in the encoder's InformedLinear.
+- ``informed_decoder`` — when True, the decoder's ``dec_out`` layer is masked
+  by ``adj`` too, so each pathway's decoder output only affects its member
+  genes.
+- ``nonneg_encoder`` — when True, the encoder's InformedLinear uses softplus
+  reparametrisation so every live weight stays positive. Deliberately named
+  ``nonneg_encoder`` (not ``nonneg``) to make explicit that this constraint
+  applies to the encoder side only. A non-negative decoder could never lower
+  a gene, which would strip pathways of the ability to repress.
+- ``standardize_input`` — when True, the encoder z-scores its input per gene
+  before the masked matmul, so no single loud gene can dominate its unit.
+
+Every option defaults to the pre-existing behaviour; the golden regression
+loss value still reproduces bit-for-bit.
+"""
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 
@@ -22,6 +46,12 @@ class InformedVAE(nn.Module):
         beta: float = 1.0,
         likelihood: str = "gaussian",
         n_cov: int = 0,
+        *,
+        init: str = "xavier",
+        normalize: str = "none",
+        informed_decoder: bool = False,
+        nonneg_encoder: bool = False,
+        standardize_input: bool = False,
     ):
         super().__init__()
         torch.manual_seed(seed)
@@ -36,7 +66,29 @@ class InformedVAE(nn.Module):
         self.likelihood_kind = likelihood
         self.n_cov = n_cov
 
-        self.encoder = Encoder(adj=adj, latent_dim=self.latent_dim, n_cov=n_cov)
+        # Phase 1c options: store for introspection and downstream code
+        # (e.g. read-outs that want to know whether nonneg is on).
+        self.init_kind = init
+        self.normalize_kind = normalize
+        self.informed_decoder = informed_decoder
+        self.nonneg_encoder = nonneg_encoder
+        self.standardize_input_enabled = standardize_input
+
+        self.encoder = Encoder(
+            adj=adj,
+            latent_dim=self.latent_dim,
+            n_cov=n_cov,
+            init=init,
+            normalize=normalize,
+            nonneg=nonneg_encoder,
+            standardize_input=standardize_input,
+        )
+
+        # Pass adj to the decoder only when informed_decoder is on.
+        # Do NOT pass nonneg or standardize_input to the decoder: a non-negative
+        # decoder cannot lower a gene, and standardize_input on latent-derived
+        # activations would fight the reconstruction loss.
+        dec_adj = adj if informed_decoder else None
 
         if likelihood == "gaussian":
             self.decoder = DenseDecoder(
@@ -44,6 +96,8 @@ class InformedVAE(nn.Module):
                 n_pathways=self.n_pathways,
                 n_genes=self.n_genes,
                 n_cov=n_cov,
+                adj=dec_adj,
+                init=init,
             )
             self.likelihood = GaussianLikelihood()
         elif likelihood == "nb":
@@ -52,6 +106,8 @@ class InformedVAE(nn.Module):
                 n_pathways=self.n_pathways,
                 n_genes=self.n_genes,
                 n_cov=n_cov,
+                adj=dec_adj,
+                init=init,
             )
             self.likelihood = None
         else:
