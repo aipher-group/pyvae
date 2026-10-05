@@ -150,6 +150,9 @@ publish-pypi = { cmd = "twine upload --skip-existing dist/*", depends-on = [
 pytorch = ">=2.3.0,<3"
 
 # --- cuda12: conda pytorch + cuda runtime, linux-64 only -----------------------
+# Pinned to 2.5.1/cuda120 -- the newest conda-forge build compatible with
+# drivers that only support up to CUDA 12.4 (see nvidia-smi's "CUDA Version").
+# 2.6+ builds on conda-forge require cuda-version >=12.6.
 [tool.pixi.feature.cuda12]
 platforms = ["linux-64"]
 
@@ -157,10 +160,7 @@ platforms = ["linux-64"]
 cuda = "12"
 
 [tool.pixi.feature.cuda12.dependencies]
-pytorch = ">=2.3.0,<3"
-
-[tool.pixi.feature.cuda12.target.linux-64.dependencies]
-pytorch-cuda = "12.*"
+pytorch = { version = "==2.5.1", build = "cuda120*" }
 
 # --- rocm72: PyPI torch from AMD ROCm index, linux-64 only ---------------------
 [tool.pixi.feature.rocm72]
@@ -178,7 +178,7 @@ torchaudio = ">=2.4,<3"
 [tool.pixi.environments]
 default = { features = ["cpu", "dev", "notebook"], solve-group = "torch" }
 ci     = { features = ["cpu", "dev"] }
-cuda12 = { features = ["cuda12", "dev", "notebook"], solve-group = "torch" }
+cuda12 = { features = ["cuda12", "dev", "notebook"], solve-group = "torch-cuda" }
 rocm72 = { features = ["rocm72", "dev", "notebook"], solve-group = "rocm" }
 # Minimal env for building/uploading the PyPI artifacts; no torch stack pulled in.
 publish = { features = ["publish"], no-default-feature = true }

@@ -1,0 +1,66 @@
+# Kang analysis: the whole experiment grid, declaratively.
+#
+# The Snakefile turns every entry below into one job. Snakemake reruns a job only
+# when its summary.csv is missing, so a killed sweep resumes where it stopped and
+# a finished one is a no-op. Add a row here to add a job; nothing else changes.
+#
+# The config names must match the `CONFIGS` tables in scripts 02 and 04. They are
+# passed through --configs, whose argparse `choices=` rejects anything unknown, so
+# a rename in a script fails the job immediately instead of silently skipping it.
+#
+# Measured on 3x A100 80GB, 64 cores.
+
+epochs: 250          # patience is pinned to epochs so cosine annealing completes
+threads_per_job: 21  # see the Snakefile header on thread oversubscription
+n_gpus: 3
+seed: 42             # the scripts default to this; the notebook is passed it explicitly
+
+data: data/kang_counts_25k.h5ad
+gmt: resources/c2.cp.reactome.v7.5.1.symbols.gmt
+data_folder: data
+
+# Architecture the notebook ships. 02 and 04 vary this internally; 03 holds it
+# fixed and needs it spelled out.
+arch: "--normalize batch --informed-decoder --nonneg-encoder --standardize-input"
+
+# --- 02 architecture ablation -------------------------------------------------
+# One job per config, so all 8 pack onto whichever GPU frees up first. Each
+# config re-seeds before build_model, so splitting them is result-identical to
+# running them in one process; that is why the old hand-balanced abl_a/abl_b
+# split is gone. ~14 min train + ~9 min metrics each.
+ablation_configs:
+  - baseline
+  - init_fan_in
+  - normalize_batch
+  - normalize_layer
+  - informed_decoder
+  - fan_in+norm
+  - norm+informed_dec
+  - all
+
+# --- 04 encoder fidelity ------------------------------------------------------
+# Two epoch budgets x 8 configs. Budgets are NOT nested: CosineAnnealingLR
+# (T_max=epochs) gives each budget its own schedule, so 100 and 250 are separate
+# experiments rather than a checkpoint of one. Compare final val loss within a
+# budget, never best_epoch across budgets.
+fidelity_budgets: [250, 100]
+fidelity_configs:
+  - baseline
+  - nonneg_only
+  - standardize_only
+  - both
+  - notebook_baseline
+  - notebook_nonneg
+  - notebook_standardize
+  - notebook_both
+
+# --- 03 sample size -----------------------------------------------------------
+# Full panel vs 5000 HVGs is the comparison that separates panel width from cell
+# count as the cause of the naive baseline's collapse, so both stay. The unit is
+# a whole (fraction x rep) grid because the median across reps is computed inside
+# the run; splitting it would have to re-derive the val split.
+sample_size:
+  ss_full_small:  { n_genes: 0,    reps: 5, fractions: [0.25, 0.1, 0.05, 0.025, 0.0125] }
+  ss_full_large:  { n_genes: 0,    reps: 1, fractions: [1.0, 0.5] }
+  ss_g5000_small: { n_genes: 5000, reps: 5, fractions: [0.25, 0.1, 0.05, 0.025, 0.0125] }
+  ss_g5000_large: { n_genes: 5000, reps: 1, fractions: [1.0, 0.5] }

@@ -1,0 +1,340 @@
+# Kang analysis workflow.
+#
+#   cd experiments/kang
+#   pixi run all                 # or: snakemake -j 63 --resources gpu=3
+#
+# Every path below is relative to this directory, so the workflow runs from here
+# and `snakemake` finds this file by name with no -s.
+#
+# The two concurrency numbers do different jobs:
+#
+#   gpu=3 caps concurrent GPU jobs at one per card. gpu_slot.sh then hands each
+#   job an actual device via flock, because Snakemake allocates a count and not
+#   a device id.
+#
+#   -j 63 caps total threads at 63 of the 64 cores, and each job declares
+#   threads=21, so three jobs saturate the box exactly once. Raise it and the
+#   metrics phase stalls: pathway_activity runs ~1,615 short scipy rank tests,
+#   and oversubscribed BLAS threads spin-wait at every barrier instead of
+#   working. Training is GPU-bound and survives it; that phase does not.
+#
+# Useful invocations, all from this directory:
+#   snakemake -n -q             what would run, touching nothing
+#   snakemake --summary         every output with its status
+#   snakemake --unlock          clear the lock left by a hard kill
+#   snakemake --rerun-incomplete    redo jobs whose outputs are half-written
+#   rm -rf outputs .snakemake   start completely from scratch
+
+import re
+
+
+configfile: "config.yaml"
+
+
+OUT = "outputs"
+LOGS = f"{OUT}/logs"
+BENCH = f"{OUT}/benchmarks"
+
+THREADS = config["threads_per_job"]
+EPOCHS = config["epochs"]
+N_GPUS = config["n_gpus"]
+DATA = config["data"]
+GMT = config["gmt"]
+ARCH = config["arch"]
+DATA_FOLDER = config["data_folder"]
+
+ABL_CONFIGS = config["ablation_configs"]
+FID_CONFIGS = config["fidelity_configs"]
+FID_BUDGETS = config["fidelity_budgets"]
+SS_JOBS = config["sample_size"]
+
+
+def alt(names):
+    """Regex alternation over literal names. re.escape matters: "fan_in+norm"
+    contains a '+', which as a bare wildcard constraint would mean "one or more
+    'n'" and silently match the wrong jobs."""
+    return "|".join(re.escape(str(n)) for n in names)
+
+
+wildcard_constraints:
+    config=alt(sorted(set(ABL_CONFIGS) | set(FID_CONFIGS))),
+    epochs=alt(FID_BUDGETS),
+    job=alt(SS_JOBS),
+
+
+# Thread limits have to reach the job as environment variables; the libraries
+# read them at import time, so setting them any later has no effect.
+ENV = (
+    f"N_GPUS={N_GPUS} "
+    "OMP_NUM_THREADS={threads} MKL_NUM_THREADS={threads} "
+    "OPENBLAS_NUM_THREADS={threads} NUMEXPR_NUM_THREADS={threads} "
+    "VECLIB_MAXIMUM_THREADS={threads} "
+)
+GPU = "bash gpu_slot.sh"
+# python -u throughout. print() is block-buffered when stdout is a file while
+# tqdm writes to stderr unbuffered, so a redirected log appears frozen at an
+# early line while the process is somewhere much later. That cost hours once.
+PY = "python -u"
+
+
+rule all:
+    input:
+        f"{OUT}/02_ablation_merged.csv",
+        expand(f"{OUT}/04_fidelity_e{{epochs}}.csv", epochs=FID_BUDGETS),
+        f"{OUT}/03_sample_size_merged.csv",
+        f"{OUT}/01_kang_showcase.executed.ipynb",
+        f"{OUT}/benchmarks.csv",
+
+
+rule ablation:
+    """One architecture-ablation config (script 02).
+
+    Per-config jobs rather than the old two-lane split: every config re-seeds
+    before build_model, so running one alone is result-identical to running it
+    inside a set, and 8 independent jobs pack onto whichever card frees first.
+    """
+    input:
+        script="02_architecture_ablation.py",
+        data=DATA,
+        gmt=GMT,
+    output:
+        f"{OUT}/ablation/{{config}}/summary.csv",
+    log:
+        f"{LOGS}/ablation_{{config}}.log",
+    benchmark:
+        f"{BENCH}/ablation_{{config}}.tsv"
+    threads: THREADS
+    resources:
+        gpu=1,
+    params:
+        epochs=EPOCHS,
+        data_folder=DATA_FOLDER,
+    shell:
+        ENV + GPU + " " + PY + " {input.script}"
+        " --device cuda --n-genes 0 --save-checkpoints"
+        " --epochs {params.epochs} --patience {params.epochs}"
+        " --data-folder {params.data_folder} --resources-dir {input.gmt}"
+        " --configs {wildcards.config}"
+        ' --run-dir "$(dirname {output})"'
+        " > {log} 2>&1"
+
+
+rule fidelity:
+    """One encoder-fidelity config at one epoch budget (script 04)."""
+    input:
+        script="04_encoder_fidelity_experiment.py",
+        data=DATA,
+        gmt=GMT,
+    output:
+        f"{OUT}/fidelity/e{{epochs}}/{{config}}/summary.csv",
+    log:
+        f"{LOGS}/fidelity_e{{epochs}}_{{config}}.log",
+    benchmark:
+        f"{BENCH}/fidelity_e{{epochs}}_{{config}}.tsv"
+    threads: THREADS
+    resources:
+        gpu=1,
+    params:
+        data_folder=DATA_FOLDER,
+    shell:
+        ENV + GPU + " " + PY + " {input.script}"
+        " --device cuda --n-genes 0 --save-checkpoints"
+        " --epochs {wildcards.epochs} --patience {wildcards.epochs}"
+        " --data-folder {params.data_folder} --resources-dir {input.gmt}"
+        " --configs {wildcards.config}"
+        ' --run-dir "$(dirname {output})"'
+        " > {log} 2>&1"
+
+
+rule sample_size:
+    """One sample-size sweep: a whole (fraction x rep) grid (script 03).
+
+    Not split per fraction: summary.csv is the median across reps, computed
+    inside the run, and every rep shares one validation split.
+    """
+    input:
+        script="03_sample_size_experiment.py",
+        data=DATA,
+        gmt=GMT,
+    output:
+        f"{OUT}/{{job}}/summary.csv",
+    log:
+        f"{LOGS}/{{job}}.log",
+    benchmark:
+        f"{BENCH}/{{job}}.tsv"
+    threads: THREADS
+    resources:
+        gpu=1,
+    params:
+        epochs=EPOCHS,
+        data_folder=DATA_FOLDER,
+        arch=ARCH,
+        n_genes=lambda w: SS_JOBS[w.job]["n_genes"],
+        reps=lambda w: SS_JOBS[w.job]["reps"],
+        fractions=lambda w: " ".join(str(f) for f in SS_JOBS[w.job]["fractions"]),
+    shell:
+        ENV + GPU + " " + PY + " {input.script}"
+        " --mode retrain --device cuda"
+        " --epochs {params.epochs} --patience {params.epochs}"
+        " {params.arch}"
+        " --data-folder {params.data_folder} --resources-dir {input.gmt}"
+        " --n-genes {params.n_genes} --reps {params.reps}"
+        " --sample-fractions {params.fractions}"
+        ' --run-dir "$(dirname {output})"'
+        " > {log} 2>&1"
+
+
+rule notebook:
+    """Execute the showcase notebook and keep the executed copy.
+
+    papermill rather than `nbconvert --execute`, though both save outputs: it
+    injects parameters into the cell tagged `parameters`, so epochs and seed come
+    from config.yaml like every other job; it writes the notebook as it goes, so
+    a job killed part way leaves the dead cell marked `status: running`; and
+    --log-output puts cell stdout in the log.
+
+    -k python3 is not optional. papermill otherwise looks for the kernel named in
+    the notebook's own metadata, which need not exist in this environment.
+
+    The notebook depends on the sample-size merge because its last figure reads
+    03_sample_size_merged.csv. It degrades gracefully when the file is absent,
+    but a full run should produce the figure rather than the fallback message.
+    """
+    input:
+        nb="01_kang_showcase.ipynb",
+        data=DATA,
+        gmt=GMT,
+        sample_size=f"{OUT}/03_sample_size_merged.csv",
+    output:
+        nb=f"{OUT}/01_kang_showcase.executed.ipynb",
+    log:
+        f"{LOGS}/notebook.log",
+    benchmark:
+        f"{BENCH}/notebook.tsv"
+    threads: THREADS
+    resources:
+        gpu=1,
+    params:
+        epochs=EPOCHS,
+        seed=config["seed"],
+    shell:
+        ENV + GPU + " papermill --no-progress-bar --log-output -k python3"
+        " -p smoke False"
+        " -p epochs {params.epochs}"
+        " -p seed {params.seed}"
+        " {input.nb} {output.nb}"
+        " > {log} 2>&1"
+
+
+# --- collection ---------------------------------------------------------------
+# Ordinary outputs, so they rebuild when any input summary changes and are
+# skipped when nothing has.
+
+
+rule merge_ablation:
+    input:
+        expand(f"{OUT}/ablation/{{config}}/summary.csv", config=ABL_CONFIGS),
+    output:
+        f"{OUT}/02_ablation_merged.csv",
+    run:
+        import pandas as pd
+
+        df = pd.concat([pd.read_csv(f) for f in input], ignore_index=True)
+        df = df.sort_values("best_val_loss").reset_index(drop=True)
+        df.to_csv(output[0], index=False)
+        print(f"[merge] {len(df)} configs -> {output[0]}")
+
+
+rule merge_fidelity:
+    input:
+        lambda w: expand(
+            f"{OUT}/fidelity/e{w.epochs}/{{config}}/summary.csv",
+            config=FID_CONFIGS,
+        ),
+    output:
+        f"{OUT}/04_fidelity_e{{epochs}}.csv",
+    run:
+        import pandas as pd
+
+        df = pd.concat([pd.read_csv(f) for f in input], ignore_index=True)
+        df.to_csv(output[0], index=False)
+        print(f"[merge] {len(df)} configs -> {output[0]}")
+
+
+rule merge_sample_size:
+    input:
+        expand(f"{OUT}/{{job}}/summary.csv", job=list(SS_JOBS)),
+    output:
+        f"{OUT}/03_sample_size_merged.csv",
+    run:
+        import pandas as pd
+
+        frames = []
+        for job, path in zip(SS_JOBS, input):
+            d = pd.read_csv(path)
+            # reps=1 runs keep a `rep` column; reps>1 runs report the median and
+            # drop it. Tag both so nobody reads a single draw as a 5-rep median.
+            d = d.drop(columns=[c for c in ("rep",) if c in d.columns])
+            d.insert(0, "job", job)
+            d.insert(1, "n_reps", SS_JOBS[job]["reps"])
+            d.insert(2, "n_genes", SS_JOBS[job]["n_genes"])
+            frames.append(d)
+        df = pd.concat(frames, ignore_index=True)
+        df.to_csv(output[0], index=False)
+        print(f"[merge] {len(df)} rows from {len(frames)} sweeps -> {output[0]}")
+
+
+rule collect_benchmarks:
+    """Gather the per-job benchmark files into one table.
+
+    Answers what the grid costs to reproduce, and whether the thread budget is
+    right: a job whose cpu_time is far below threads x wall time spent it waiting
+    rather than working, which is the oversubscription the header warns about.
+
+    Benchmarks are globbed rather than declared as inputs, so a job adopted from
+    an earlier run, which has no benchmark file, neither fails the build nor
+    forces a rerun of a result that already exists.
+    """
+    input:
+        f"{OUT}/02_ablation_merged.csv",
+        expand(f"{OUT}/04_fidelity_e{{epochs}}.csv", epochs=FID_BUDGETS),
+        f"{OUT}/03_sample_size_merged.csv",
+        f"{OUT}/01_kang_showcase.executed.ipynb",
+    output:
+        f"{OUT}/benchmarks.csv",
+    run:
+        import glob
+        import os
+
+        import pandas as pd
+
+        expected = (
+            len(ABL_CONFIGS)
+            + len(FID_BUDGETS) * len(FID_CONFIGS)
+            + len(SS_JOBS)
+            + 1  # the notebook
+        )
+        rows = []
+        for path in sorted(glob.glob(f"{BENCH}/*.tsv")):
+            d = pd.read_csv(path, sep="\t")
+            if d.empty:
+                continue
+            d.insert(0, "job", os.path.basename(path).removesuffix(".tsv"))
+            rows.append(d)
+
+        if not rows:
+            pd.DataFrame(columns=["job"]).to_csv(output[0], index=False)
+            print(
+                f"[bench] no benchmark files yet: all {expected} jobs were "
+                "adopted from earlier runs. Re-run a job to measure it."
+            )
+        else:
+            df = pd.concat(rows, ignore_index=True)
+            if "s" in df.columns:
+                df = df.sort_values("s", ascending=False)
+            df.to_csv(output[0], index=False)
+            print(f"[bench] {len(df)} of {expected} jobs measured -> {output[0]}")
+            if "s" in df.columns:
+                print(f"[bench] total measured wall time: {df['s'].sum() / 3600:.2f} h")
+            if "max_rss" in df.columns:
+                print(f"[bench] peak RSS across jobs: {df['max_rss'].max():.0f} MB")

@@ -33,6 +33,20 @@ $M_{ji}=1$ iff gene $i$ belongs to pathway $j$. This reduces parameters, injects
 prior biological knowledge, and makes each latent node interpretable as a
 pathway.
 
+
+## Validation benchmark
+
+The canonical end-to-end validation of pyvae lives in
+[`experiments/kang/`](experiments/kang/): a Snakemake grid of 28 training jobs
+on the Kang 2018 PBMC interferon-β dataset, plus a showcase notebook that
+examines one model closely with saturation, unit fidelity, decoder-side
+pathway ranking, gene attribution, and counterfactual prediction. The sweep
+exercises the architecture ablation, the encoder-fidelity constraints, and
+the sample-size behaviour against a model-free baseline. See
+[`experiments/kang/README.md`](experiments/kang/README.md) for how to run it
+and [`experiments/kang/FINDINGS.md`](experiments/kang/FINDINGS.md) for what
+the results show.
+
 ## Features
 
 ### Models
@@ -47,12 +61,28 @@ PyTorch with no `scvi-tools` dependency). `n_cov` sets the width of an
 auxiliary one-hot covariate (cell type, condition, or both), which the model
 concatenates into the encoder and decoder to support conditional inference.
 
+ The encoder has four optional constraints: `init="fan_in"` for per-unit Xavier
+scaling, `normalize="batch"` for BatchNorm on the pre-activation (which keeps
+units off tanh's flat tail), `nonneg_encoder=True` for a softplus
+reparameterisation that removes sign freedom (so a unit cannot encode its
+pathway upside-down), and `standardize_input=True` for BatchNorm on the input
+(which removes scale freedom). `informed_decoder=True` applies the same
+Reactome mask symmetrically on the decoder, which is what enables faithful
+counterfactual prediction.
+
 ### Training
 
 `train_ivae` is the legacy training loop: gradient clipping plus early
 stopping. `train_ivae_modern` trains the count model instead, adding KL
 warmup, AdamW with decoupled weight decay, cosine LR annealing, and
 best-weight restore.
+
+ `train_ivae_modern` also accepts `cov_train` and `cov_val` to thread one-hot
+covariates through both encoder and decoder — required for the counterfactual
+read-out and recommended whenever cell composition varies between conditions.
+Datasets are moved to the training device once at the start of training, so
+batches cost a device-side gather rather than a host-to-device copy per
+epoch; a full-panel Kang run takes about 4 minutes on a single A100.
 
 ### Interpretation
 
@@ -65,6 +95,24 @@ signed Bayes factor per pathway between two groups of cells, based on
 Monte-Carlo pairing of raw pathway activations. `integrated_gradients`
 attributes a single pathway's activation back to each input gene
 (Sundararajan et al., 2017), implemented in pure PyTorch.
+
+
+Four pathway-level read-outs cover the gap between a VAE and a traditional
+pathway-ranking workflow. `pathway_unit_fidelity` correlates each unit's
+activation against the mean z-scored expression of its own member genes, so
+you can audit whether a unit actually represents the pathway named after it
+(and whether its sign is correct). `differential_expression` samples
+posterior per-gene differential expression between two groups (Boyeau et
+al. 2019), with observed-detection filtering so decoder-confident but
+barely-observed phantom genes do not float to the top of the ranking.
+`pathway_activity` runs a tie-corrected competitive Mann-Whitney rank test
+of a pathway's member genes against the rest of the panel on the output of
+`differential_expression`, which is the ranking most biologists actually
+want; it also reports `top_gene_share` so you can tell when a hit is really
+one gene wearing a pathway's name. `pseudobulk_paired_test` collapses cells
+to donor-level pseudobulk and runs a paired Wilcoxon per gene — the Squair
+et al. 2021 correction for cell-level pseudo-replication, which inflates
+cell-level p-values badly when donors are the real unit of replication.
 
 ### Data helpers
 
@@ -218,9 +266,13 @@ pyvae/
 ├── train.py       training loops: train_ivae, train_ivae_modern
 ├── datasets.py    Kang dataset loader
 ├── bio.py         Reactome adjacency helpers, swap_condition
-└── interpret.py   bayes_factor_da, integrated_gradients
+├── interpret.py   bayes_factor_da, integrated_gradients,
+│                   pathway_unit_fidelity, differential_expression,
+│                   pathway_activity, pseudobulk_paired_test
 tests/             contract + unit tests
 conda-recipe/      conda-forge recipe + submission guide
+experiments/kang/  canonical validation benchmark (Kang 2018 IFN-β PBMCs);
+                   see experiments/kang/README.md and FINDINGS.md
 ```
 
 ## Acknowledgements

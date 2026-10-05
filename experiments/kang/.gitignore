@@ -1,0 +1,8 @@
+data/
+outputs/
+# Second output convention, left over from before everything wrote to
+# outputs/. Nothing generates results/ any more.
+results/
+.ipynb_checkpoints/
+*.pt
+resources/
