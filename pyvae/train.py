@@ -22,6 +22,7 @@ Phase 1d additions:
   ``scheduler.step()``, so it reports the rate the epoch actually trained
   at rather than the one queued for the next epoch.
 """
+
 from __future__ import annotations
 
 import copy
@@ -313,8 +314,12 @@ def train_ivae_modern(
     # degrade gracefully.
     x_train_tensor = as_float_tensor(x_train, name="x_train").to(device_t)
     x_val_tensor = as_float_tensor(x_val, name="x_val").to(device_t)
-    x_counts_train_tensor = as_float_tensor(x_counts_train, name="x_counts_train").to(device_t)
-    x_counts_val_tensor = as_float_tensor(x_counts_val, name="x_counts_val").to(device_t)
+    x_counts_train_tensor = as_float_tensor(x_counts_train, name="x_counts_train").to(
+        device_t
+    )
+    x_counts_val_tensor = as_float_tensor(x_counts_val, name="x_counts_val").to(
+        device_t
+    )
 
     # Covariate handling. Validate up front so a shape bug fails on the first
     # tensor conversion rather than at some unclear point inside the epoch.

@@ -21,6 +21,7 @@ Phase 1e housekeeping in ``load_kang``:
   Figshare download URL routes through a WAF that sometimes returns an
   HTML browser-check page instead of the h5ad file.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -28,7 +29,6 @@ from urllib.request import urlretrieve
 
 import pandas as pd
 import scanpy as sc
-
 
 # Module-level constant. Promoted from inside ``load_kang`` so tests can assert
 # on its value directly and so downstream tools can look it up without

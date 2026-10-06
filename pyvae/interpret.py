@@ -19,9 +19,9 @@ covariate confound.
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import torch
-import numpy as np
 
 from pyvae.models import InformedVAE
 
@@ -206,6 +206,7 @@ def integrated_gradients(
     averaged_gradient = accumulated_gradient / steps
     return (x - baseline) * averaged_gradient
 
+
 def pathway_unit_fidelity(
     model,
     x,
@@ -309,7 +310,9 @@ def pathway_unit_fidelity(
     elif isinstance(x, torch.Tensor):
         x_arr = x.detach().cpu().numpy()
     else:
-        raise TypeError(f"x must be Tensor, ndarray, or DataFrame; got {type(x).__name__}")
+        raise TypeError(
+            f"x must be Tensor, ndarray, or DataFrame; got {type(x).__name__}"
+        )
     x_arr = np.asarray(x_arr, dtype=np.float32)
 
     if isinstance(adj, pd.DataFrame):
@@ -322,7 +325,9 @@ def pathway_unit_fidelity(
         adj_arr = adj.detach().cpu().numpy()
         pathway_names = [f"pathway_{j}" for j in range(adj.shape[1])]
     else:
-        raise TypeError(f"adj must be Tensor, ndarray, or DataFrame; got {type(adj).__name__}")
+        raise TypeError(
+            f"adj must be Tensor, ndarray, or DataFrame; got {type(adj).__name__}"
+        )
     adj_arr = np.asarray(adj_arr, dtype=np.float32)
 
     # --- Shape checks ---
@@ -340,9 +345,7 @@ def pathway_unit_fidelity(
             f"Model was trained with n_cov={model_n_cov} but no cov was provided."
         )
     if model_n_cov == 0 and cov is not None:
-        raise ValueError(
-            "Model has n_cov=0 but a cov was provided. Pass cov=None."
-        )
+        raise ValueError("Model has n_cov=0 but a cov was provided. Pass cov=None.")
     if cov is not None:
         if isinstance(cov, pd.DataFrame):
             cov_arr = cov.values
@@ -351,7 +354,9 @@ def pathway_unit_fidelity(
         elif isinstance(cov, torch.Tensor):
             cov_arr = cov.detach().cpu().numpy()
         else:
-            raise TypeError(f"cov must be Tensor, ndarray, or DataFrame; got {type(cov).__name__}")
+            raise TypeError(
+                f"cov must be Tensor, ndarray, or DataFrame; got {type(cov).__name__}"
+            )
         cov_arr = np.asarray(cov_arr, dtype=np.float32)
         if cov_arr.shape[0] != n_cells:
             raise ValueError(
@@ -399,7 +404,7 @@ def pathway_unit_fidelity(
             continue  # corr stays NaN
 
         # Mean z-scored expression across the j-th pathway's members
-        member_mask = adj_arr[:, j].astype(bool)   # shape (n_genes,)
+        member_mask = adj_arr[:, j].astype(bool)  # shape (n_genes,)
         mean_z_j = x_z[:, member_mask].mean(axis=1)  # shape (n_cells,)
 
         h_j = h_arr[:, j]  # shape (n_cells,)
@@ -430,6 +435,7 @@ def pathway_unit_fidelity(
         },
         index=pd.Index(pathway_names, name="pathway"),
     )
+
 
 def differential_expression(
     model,
@@ -632,10 +638,10 @@ def differential_expression(
     # --- Accumulators for the per-gene statistics ---
     # Kept on CPU as numpy arrays to avoid keeping (n_samples * n_pairs, n_genes)
     # in GPU memory (that would be ~50k * 5k * 4 bytes = 1 GB for defaults).
-    de_count = np.zeros(n_genes, dtype=np.float64)      # |lfc| > delta
-    up_count = np.zeros(n_genes, dtype=np.float64)      # lfc > 0
-    lfc_sum = np.zeros(n_genes, dtype=np.float64)       # sum of lfc
-    lfc_sq_sum = np.zeros(n_genes, dtype=np.float64)    # sum of lfc^2 (for std)
+    de_count = np.zeros(n_genes, dtype=np.float64)  # |lfc| > delta
+    up_count = np.zeros(n_genes, dtype=np.float64)  # lfc > 0
+    lfc_sum = np.zeros(n_genes, dtype=np.float64)  # sum of lfc
+    lfc_sq_sum = np.zeros(n_genes, dtype=np.float64)  # sum of lfc^2 (for std)
     total_pairs = n_samples * n_pairs
 
     sigma_a = torch.exp(0.5 * log_var_a)
@@ -669,13 +675,13 @@ def differential_expression(
             de_count += (np.abs(log2fc_np) > delta).sum(axis=0)
             up_count += (log2fc_np > 0).sum(axis=0)
             lfc_sum += log2fc_np.sum(axis=0)
-            lfc_sq_sum += (log2fc_np ** 2).sum(axis=0)
+            lfc_sq_sum += (log2fc_np**2).sum(axis=0)
 
     # --- Compute per-gene summary statistics ---
     proba_de = de_count / total_pairs
     proba_up = up_count / total_pairs
     lfc_mean = lfc_sum / total_pairs
-    lfc_var = lfc_sq_sum / total_pairs - lfc_mean ** 2
+    lfc_var = lfc_sq_sum / total_pairs - lfc_mean**2
     lfc_std = np.sqrt(np.maximum(lfc_var, 0))
     # Detection is a property of the observed data, not of the decoder: a gene
     # seen in a handful of cells still gets a confident px_scale, so the decoder
@@ -736,6 +742,7 @@ def differential_expression(
     ).drop(columns="_abs_lfc")
 
     return df
+
 
 def _benjamini_hochberg(pvalues):
     """Benjamini-Hochberg (1995) FDR-adjusted p-values.
@@ -1104,6 +1111,7 @@ def pathway_activity(
 
     return df
 
+
 def pseudobulk_paired_test(
     counts,
     donor_ids,
@@ -1237,6 +1245,7 @@ def pseudobulk_paired_test(
     # --- Coerce counts to a plain numpy array ---
     try:
         import torch
+
         if isinstance(counts, torch.Tensor):
             counts_arr = counts.detach().cpu().numpy()
         else:
@@ -1249,6 +1258,7 @@ def pseudobulk_paired_test(
         else:
             try:
                 from scipy import sparse
+
                 if sparse.issparse(counts):
                     counts_arr = counts.toarray()
                 else:
@@ -1387,5 +1397,3 @@ def pseudobulk_paired_test(
     ).drop(columns="_abs_lfc")
 
     return df
-
-
