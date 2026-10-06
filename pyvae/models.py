@@ -20,6 +20,7 @@ encoder and (for the informed_decoder flag) the decoder:
 Every option defaults to the pre-existing behaviour; the golden regression
 loss value still reproduces bit-for-bit.
 """
+
 from __future__ import annotations
 
 import torch

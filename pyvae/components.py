@@ -28,6 +28,7 @@ Phase 1c additions:
 Every new option defaults to the pre-existing behaviour, so the golden
 regression test still passes bit-for-bit.
 """
+
 from __future__ import annotations
 
 import torch
@@ -35,7 +36,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from pyvae.layers import InformedLinear
-
 
 # ---------------------------------------------------------------------------
 # Utility functions
@@ -132,6 +132,7 @@ def as_float_tensor(data, name: str = "input") -> torch.Tensor:
     # numpy.ndarray. Lazy import so this module works without numpy present.
     try:
         import numpy as np
+
         if isinstance(data, np.ndarray):
             # ascontiguousarray, not astype: from_numpy rejects negative
             # strides, which a reversed view like x[::-1] carries. Input that
@@ -143,8 +144,10 @@ def as_float_tensor(data, name: str = "input") -> torch.Tensor:
     # pandas.DataFrame / Series.
     try:
         import pandas as pd
+
         if isinstance(data, (pd.DataFrame, pd.Series)):
             import numpy as np
+
             return torch.from_numpy(np.ascontiguousarray(data.values, dtype=np.float32))
     except ImportError:
         pass
@@ -152,8 +155,10 @@ def as_float_tensor(data, name: str = "input") -> torch.Tensor:
     # scipy sparse.
     try:
         from scipy import sparse
+
         if sparse.issparse(data):
             import numpy as np
+
             return torch.from_numpy(data.toarray().astype(np.float32, copy=False))
     except ImportError:
         pass

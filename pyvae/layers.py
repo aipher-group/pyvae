@@ -13,12 +13,12 @@ genes. This file extends it with five independent options that constrain
 Every option defaults to the pre-existing behaviour, so the golden regression
 test still passes bit-for-bit.
 """
+
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 
 _ALLOWED_ACTIVATIONS = ("tanh", "relu", "linear")
 _ALLOWED_INITS = ("xavier", "fan_in")
@@ -132,9 +132,7 @@ class InformedLinear(nn.Module):
                 f"activation must be one of {_ALLOWED_ACTIVATIONS}; got {activation!r}"
             )
         if init not in _ALLOWED_INITS:
-            raise ValueError(
-                f"init must be one of {_ALLOWED_INITS}; got {init!r}"
-            )
+            raise ValueError(f"init must be one of {_ALLOWED_INITS}; got {init!r}")
         if normalize not in _ALLOWED_NORMALIZE:
             raise ValueError(
                 f"normalize must be one of {_ALLOWED_NORMALIZE}; got {normalize!r}"
