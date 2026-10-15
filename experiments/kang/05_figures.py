@@ -153,24 +153,29 @@ def fig1_ranked_units(d: dict, figs: Path) -> None:
               for s in top.index]
     colours = [C_ORANGE if v > 0 else C_BLUE for v in top["member_shift_z"]]
 
-    fig, ax = plt.subplots(figsize=(7.4, 0.29 * len(top) + 1.2))
+    fig, ax = plt.subplots(figsize=(5.9, 0.26 * len(top) + 1.4))
     y = np.arange(len(top))[::-1]
     ax.barh(y, top["member_shift_z"].to_numpy(), color=colours, height=0.7)
     ax.set_yticks(y)
-    ax.set_yticklabels(labels, fontsize=7.5)
+    ax.set_yticklabels(labels, fontsize=7)
     for yy, name in zip(y, top.index):
         if name in (TARGET, PARENT):
+            band_colour = "#fdebd8" if name == TARGET else "#fef4e6"
+            ax.axhspan(yy - 0.42, yy + 0.42, color=band_colour, zorder=0)
             ax.annotate("◀ known answer" if name == TARGET else "◀ its parent",
-                        (top.loc[name, "member_shift_z"], yy), fontsize=7.5,
+                        (top.loc[name, "member_shift_z"], yy), fontsize=7,
                         va="center",
                         ha="left" if top.loc[name, "member_shift_z"] > 0
                         else "right", color="#0b0b0b", fontweight="bold")
-    ax.axvline(0, color=C_GREY, lw=0.8)
-    ax.set_xlabel("member_shift_z   (control → stimulated)")
+    ax.axvline(0, color="#4a4a46", lw=1.0)
+    ax.set_xlabel("member_shift_z   (control → stimulated)", fontsize=9)
     ax.tick_params(length=0)
     ax.grid(axis="y", visible=False)
-    ax.set_title(f"Kang: the units the condition moves, {len(units):,} ranked, "
-                 f"target at {rank_target}", fontsize=10)
+    ax.grid(axis="x", color=C_FAINT, lw=0.5, alpha=0.7, zorder=0)
+    ax.set_title(f"Kang: the units the condition moves\n"
+                 f"{len(units):,} units ranked by member_shift_z, "
+                 f"target at rank {rank_target}",
+                 fontsize=10, pad=10, loc="left")
     save(fig, figs / "fig1_ranked_units.png")
 
 

@@ -230,3 +230,4 @@ sync.sh
 
 # Rendered paper draft (regenerated from DRAFT.md via pandoc, kept out of repo)
 experiments/DRAFT.pdf
+experiments/DRAFT.md
