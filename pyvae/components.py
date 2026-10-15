@@ -25,6 +25,22 @@ Phase 1c additions:
 - ``DenseDecoder`` and ``CountDecoder`` now accept ``adj`` and ``init`` to
   route through ``_make_dec_out``.
 
+Pathway-space conditioning:
+
+- ``_make_dec_out`` accepts ``nonneg``, so the decoder's unit->gene weights can
+  carry the same softplus reparameterisation the encoder already has. Without it
+  a unit's own sign says nothing about its genes: measured on trained fits,
+  ``dec_out`` is ~50% negative and the per-unit fraction of positive weights has
+  median 0.500.
+- ``Encoder`` accepts ``use_cov``. When False the covariate never reaches ``z``,
+  which is what makes a decoder-side covariate term the *whole* conditional
+  effect rather than one of two routes.
+- The decoders accept ``cov_mode``. ``"gene"`` is the original dense
+  ``(n_genes, n_cov)`` term added after the mask, which bypasses the annotation
+  entirely. ``"pathway"`` instead adds an ``(n_pathways, n_cov)`` term inside the
+  pathway layer, so the covariate's effect is expressed in pathway coordinates
+  and reaches a gene only through the annotation.
+
 Every new option defaults to the pre-existing behaviour, so the golden
 regression test still passes bit-for-bit.
 """
@@ -174,6 +190,7 @@ def _make_dec_out(
     n_genes: int,
     adj: torch.Tensor | None = None,
     init: str = "xavier",
+    nonneg: bool = False,
 ) -> nn.Module:
     """Build the decoder's output layer, dense or masked.
 
@@ -191,6 +208,14 @@ def _make_dec_out(
     init : {"xavier", "fan_in"}, default "xavier"
         Weight initialisation for the masked variant. Ignored when ``adj`` is
         None (nn.Linear uses PyTorch's default kaiming_uniform_).
+    nonneg : bool, default False
+        When True, the masked variant stores weights pre-softplus so every live
+        unit->gene weight is strictly positive. A unit rising then raises every
+        one of its member genes, which is what gives a pathway's activity a
+        direction. It costs no expressiveness: the pathway layer is a tanh and
+        may be negative, so a gene can still fall -- the direction is carried by
+        the unit's activity rather than by the weight. Requires ``adj``, since a
+        dense decoder has no units to orient; rejected upstream otherwise.
 
     Returns
     -------
@@ -222,6 +247,7 @@ def _make_dec_out(
         activation="linear",
         init=init,
         mask_bias=False,
+        nonneg=nonneg,
     )
 
 
@@ -237,6 +263,20 @@ class Encoder(nn.Module):
     parameters that let ``InformedVAE`` pass through the four encoder-side
     constraint options (``init``, ``normalize``, ``nonneg``, ``standardize_input``).
     Every option defaults to the pre-existing behaviour.
+
+    ``use_cov`` controls whether the covariate reaches ``z`` at all. With it on
+    (the default, and the original behaviour) ``cov`` is concatenated onto the
+    pathway layer's output before ``fc_mean``, so the covariate has a route into
+    the latent. With it off, ``fc_mean`` is built at the pathway layer's own
+    width and ``forward`` ignores ``cov`` entirely.
+
+    Turning it off matters when the decoder carries a covariate term: with both
+    routes live, a decoder-side contrast is only *part* of the conditional
+    effect, and the two parts can point in different directions. Measured on a
+    125k-cell fit, reading the decoder term alone while the encoder route was
+    open ranked the known target 1,246th of 1,615 while the gene-level signal
+    looked correct. With the encoder route closed the decoder term is provably
+    the whole contrast.
     """
 
     def __init__(
@@ -249,10 +289,14 @@ class Encoder(nn.Module):
         normalize: str = "none",
         nonneg: bool = False,
         standardize_input: bool = False,
+        use_cov: bool = True,
+        use_mask: bool = True,
     ):
         super().__init__()
         n_pathways = adj.shape[1]
         self.n_cov = n_cov
+        self.use_cov = use_cov
+        self.use_mask = use_mask
         self.informed = InformedLinear(
             adj,
             activation="tanh",
@@ -260,19 +304,17 @@ class Encoder(nn.Module):
             normalize=normalize,
             nonneg=nonneg,
             standardize_input=standardize_input,
+            use_mask=use_mask,
         )
-        if n_cov > 0:
-            self.fc_mean = nn.Linear(n_pathways + n_cov, latent_dim)
-            self.fc_log_var = nn.Linear(n_pathways + n_cov, latent_dim)
-        else:
-            self.fc_mean = nn.Linear(n_pathways, latent_dim)
-            self.fc_log_var = nn.Linear(n_pathways, latent_dim)
+        fc_in = n_pathways + n_cov if (n_cov > 0 and use_cov) else n_pathways
+        self.fc_mean = nn.Linear(fc_in, latent_dim)
+        self.fc_log_var = nn.Linear(fc_in, latent_dim)
 
     def forward(
         self, x: torch.Tensor, cov: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         h = self.informed(x)
-        if self.n_cov > 0:
+        if self.n_cov > 0 and self.use_cov:
             if cov is None:
                 raise ValueError(
                     f"Encoder was built with n_cov={self.n_cov} > 0 but forward() "
@@ -282,6 +324,9 @@ class Encoder(nn.Module):
             mu = self.fc_mean(h_cat)
             log_var = torch.clamp(self.fc_log_var(h_cat), -3, 3)
         else:
+            # use_cov=False still accepts cov, and ignores it: the model as a
+            # whole needs it for the decoder, so refusing it here would force
+            # every caller to special-case the encoder.
             mu = self.fc_mean(h)
             log_var = torch.clamp(self.fc_log_var(h), -3, 3)
         return mu, log_var, h
@@ -300,6 +345,18 @@ class DenseDecoder(nn.Module):
     model level), the ``dec_out`` layer is masked so each pathway output
     only affects its member genes. Otherwise ``dec_out`` remains a dense
     ``nn.Linear`` and current behaviour is reproduced exactly.
+    ``nonneg`` forwards to ``dec_out``, constraining every live unit->gene weight
+    to be positive so a unit's activity has a direction (see ``_make_dec_out``).
+
+    ``cov_mode`` decides where a covariate's effect lives. ``"gene"`` is the
+    original dense ``(n_genes, n_cov)`` term added after the masked layer, which
+    bypasses the annotation: the contrast between two levels is one dense weight
+    difference, and a permuted gene->pathway map reproduces it unchanged.
+    ``"pathway"`` instead adds an ``(n_pathways, n_cov)`` term inside the pathway
+    layer and omits the gene-level one, so the effect is a vector in pathway
+    coordinates that reaches a gene only through the mask. The two are mutually
+    exclusive, and only one of the attributes ``cov_decoder`` / ``cov_path``
+    exists on a given instance.
     """
 
     def __init__(
@@ -311,19 +368,31 @@ class DenseDecoder(nn.Module):
         *,
         adj: torch.Tensor | None = None,
         init: str = "xavier",
+        nonneg: bool = False,
+        cov_mode: str = "gene",
     ):
         super().__init__()
+        if cov_mode not in ("gene", "pathway"):
+            raise ValueError(
+                f'cov_mode must be "gene" or "pathway"; got {cov_mode!r}'
+            )
         self.n_cov = n_cov
+        self.cov_mode = cov_mode
         self.dec_latent = nn.Linear(latent_dim, n_pathways)
-        self.dec_out = _make_dec_out(n_pathways, n_genes, adj, init)
+        self.dec_out = _make_dec_out(n_pathways, n_genes, adj, init, nonneg)
         if n_cov > 0:
-            # No bias: the per-gene baseline is provided by dec_out's bias;
-            # this layer should only capture the shift due to the label.
-            self.cov_decoder = nn.Linear(n_cov, n_genes, bias=False)
+            if cov_mode == "pathway":
+                # No bias, for the same reason as the gene-level term: the
+                # baseline belongs to dec_out, and this layer should carry only
+                # the shift due to the label.
+                self.cov_path = nn.Linear(n_cov, n_pathways, bias=False)
+            else:
+                # No bias: the per-gene baseline is provided by dec_out's bias;
+                # this layer should only capture the shift due to the label.
+                self.cov_decoder = nn.Linear(n_cov, n_genes, bias=False)
 
     def forward(self, z: torch.Tensor, cov: torch.Tensor | None = None) -> torch.Tensor:
-        h_prime = torch.tanh(self.dec_latent(z))
-        x_hat = self.dec_out(h_prime)
+        pre = self.dec_latent(z)
         if self.n_cov > 0:
             if cov is None:
                 raise ValueError(
@@ -331,6 +400,11 @@ class DenseDecoder(nn.Module):
                     f"forward() got cov=None; pass a (batch, {self.n_cov}) "
                     f"covariate tensor"
                 )
+            if self.cov_mode == "pathway":
+                pre = pre + self.cov_path(cov)
+        h_prime = torch.tanh(pre)
+        x_hat = self.dec_out(h_prime)
+        if self.n_cov > 0 and self.cov_mode == "gene":
             x_hat = x_hat + self.cov_decoder(cov)
         return x_hat
 
@@ -343,6 +417,18 @@ class CountDecoder(nn.Module):
     so each pathway output only affects its member genes' logits. Softmax
     is applied on the (batched) logit vector as before; the mask does not
     change the softmax's normalisation.
+    ``nonneg`` forwards to ``dec_out``, constraining every live unit->gene weight
+    to be positive so a unit's activity has a direction (see ``_make_dec_out``).
+
+    ``cov_mode`` decides where a covariate's effect lives. ``"gene"`` is the
+    original dense ``(n_genes, n_cov)`` term added after the masked layer, which
+    bypasses the annotation: the contrast between two levels is one dense weight
+    difference, and a permuted gene->pathway map reproduces it unchanged.
+    ``"pathway"`` instead adds an ``(n_pathways, n_cov)`` term inside the pathway
+    layer and omits the gene-level one, so the effect is a vector in pathway
+    coordinates that reaches a gene only through the mask. The two are mutually
+    exclusive, and only one of the attributes ``cov_decoder`` / ``cov_path``
+    exists on a given instance.
     """
 
     def __init__(
@@ -354,21 +440,33 @@ class CountDecoder(nn.Module):
         *,
         adj: torch.Tensor | None = None,
         init: str = "xavier",
+        nonneg: bool = False,
+        cov_mode: str = "gene",
     ):
         super().__init__()
+        if cov_mode not in ("gene", "pathway"):
+            raise ValueError(
+                f'cov_mode must be "gene" or "pathway"; got {cov_mode!r}'
+            )
         self.n_cov = n_cov
+        self.cov_mode = cov_mode
         self.dec_latent = nn.Linear(latent_dim, n_pathways)
-        self.dec_out = _make_dec_out(n_pathways, n_genes, adj, init)
+        self.dec_out = _make_dec_out(n_pathways, n_genes, adj, init, nonneg)
         if n_cov > 0:
-            # No bias: the per-gene baseline is provided by dec_out's bias;
-            # this layer should only capture the shift due to the label.
-            self.cov_decoder = nn.Linear(n_cov, n_genes, bias=False)
+            if cov_mode == "pathway":
+                # No bias, for the same reason as the gene-level term: the
+                # baseline belongs to dec_out, and this layer should carry only
+                # the shift due to the label.
+                self.cov_path = nn.Linear(n_cov, n_pathways, bias=False)
+            else:
+                # No bias: the per-gene baseline is provided by dec_out's bias;
+                # this layer should only capture the shift due to the label.
+                self.cov_decoder = nn.Linear(n_cov, n_genes, bias=False)
         # Per-gene log-dispersion, exponentiated in ``theta`` to enforce positivity.
         self.px_r = nn.Parameter(torch.zeros(n_genes))
 
     def forward(self, z: torch.Tensor, cov: torch.Tensor | None = None) -> torch.Tensor:
-        h_prime = torch.tanh(self.dec_latent(z))
-        logits = self.dec_out(h_prime)
+        pre = self.dec_latent(z)
         if self.n_cov > 0:
             if cov is None:
                 raise ValueError(
@@ -376,6 +474,11 @@ class CountDecoder(nn.Module):
                     f"forward() got cov=None; pass a (batch, {self.n_cov}) "
                     f"covariate tensor"
                 )
+            if self.cov_mode == "pathway":
+                pre = pre + self.cov_path(cov)
+        h_prime = torch.tanh(pre)
+        logits = self.dec_out(h_prime)
+        if self.n_cov > 0 and self.cov_mode == "gene":
             logits = logits + self.cov_decoder(cov)
         return torch.softmax(logits, dim=1)
 

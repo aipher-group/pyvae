@@ -1,65 +1,68 @@
-# Kang analysis workflow.
+# Kang: the architecture decision, checked against a known answer.
 #
 #   cd experiments/kang
-#   pixi run all                 # or: snakemake -j 63 --resources gpu=3
+#   ./00_setup.sh                # fetch the data and the Reactome collection
+#   pixi run all                 # or: snakemake -j 42 --resources gpu=2
+#
+# Two acts, in order:
+#
+#   1. architecture       01_architecture.py        which decoder uses the mask
+#   1b. encoder_ablation  01b_encoder_ablation.py   do the fixed options earn it
+#   1c. saturation        01c_saturation.py         is worth confounded by it
+#   2. units              02_kang_units.ipynb       the read-out, over the units
+#      figures            05_figures.py             the four figures, CPU only
+#      verify             verify_findings.py        every number quoted
+#
+# **What this experiment is for.** Kang et al. (2018) is PBMCs, interferon-beta
+# stimulated against control, so `REACTOME_INTERFERON_ALPHA_BETA_SIGNALING` is
+# fixed as the answer before anything runs. That makes this the external check
+# on the architecture `experiments/multiple_mieloma` selects: whether it wins
+# for the right reason rather than merely winning.
+#
+# It is also where the old read-out is shown to be annotation-blind. The
+# gene-level competitive test this experiment used to report as its headline
+# ranks the right pathway **first in all eight arms of act 1, including every
+# arm whose gene->pathway map is shuffled**. Ranking the model's own units
+# instead, the same pathway sat at 1,615 of 1,615 under the shipped decoder and
+# at 1 under the selected one.
 #
 # Every path below is relative to this directory, so the workflow runs from here
 # and `snakemake` finds this file by name with no -s.
 #
 # The two concurrency numbers do different jobs:
 #
-#   gpu=3 caps concurrent GPU jobs at one per card. gpu_slot.sh then hands each
+#   gpu=2 caps concurrent GPU jobs at one per card. gpu_slot.sh then hands each
 #   job an actual device via flock, because Snakemake allocates a count and not
 #   a device id.
 #
-#   -j 63 caps total threads at 63 of the 64 cores, and each job declares
-#   threads=21, so three jobs saturate the box exactly once. Raise it and the
-#   metrics phase stalls: pathway_activity runs ~1,615 short scipy rank tests,
-#   and oversubscribed BLAS threads spin-wait at every barrier instead of
-#   working. Training is GPU-bound and survives it; that phase does not.
+#   -j 42 caps total threads, and each job declares threads=21. Raise it and the
+#   read-out phase stalls: oversubscribed BLAS threads spin-wait at every
+#   barrier instead of working. Training is GPU-bound and survives it; that
+#   phase does not.
 #
 # Useful invocations, all from this directory:
-#   snakemake -n -q             what would run, touching nothing
-#   snakemake --summary         every output with its status
-#   snakemake --unlock          clear the lock left by a hard kill
+#   snakemake -n -q                 what would run, touching nothing
+#   snakemake verify                re-check FINDINGS.md against the outputs
+#   snakemake --summary             every output with its status
+#   snakemake --unlock              clear the lock left by a hard kill
 #   snakemake --rerun-incomplete    redo jobs whose outputs are half-written
-#   rm -rf outputs .snakemake   start completely from scratch
-
-import re
+#   rm -rf outputs .snakemake       start completely from scratch
 
 
 configfile: "config.yaml"
 
 
 OUT = "outputs"
-LOGS = f"{OUT}/logs"
-BENCH = f"{OUT}/benchmarks"
 
 THREADS = config["threads_per_job"]
 EPOCHS = config["epochs"]
+SEED = config["seed"]
 N_GPUS = config["n_gpus"]
-DATA = config["data"]
 GMT = config["gmt"]
-ARCH = config["arch"]
 DATA_FOLDER = config["data_folder"]
-
-ABL_CONFIGS = config["ablation_configs"]
-FID_CONFIGS = config["fidelity_configs"]
-FID_BUDGETS = config["fidelity_budgets"]
-SS_JOBS = config["sample_size"]
-
-
-def alt(names):
-    """Regex alternation over literal names. re.escape matters: "fan_in+norm"
-    contains a '+', which as a bare wildcard constraint would mean "one or more
-    'n'" and silently match the wrong jobs."""
-    return "|".join(re.escape(str(n)) for n in names)
-
-
-wildcard_constraints:
-    config=alt(sorted(set(ABL_CONFIGS) | set(FID_CONFIGS))),
-    epochs=alt(FID_BUDGETS),
-    job=alt(SS_JOBS),
+# `pyvae.load_kang` downloads this on first use, from the figshare API endpoint.
+# `00_setup.sh` does it up front so a GPU job never waits on a 38 MB download.
+DATA = f"{DATA_FOLDER}/kang_counts_25k.h5ad"
 
 
 # Thread limits have to reach the job as environment variables; the libraries
@@ -75,231 +78,274 @@ GPU = "bash gpu_slot.sh"
 # tqdm writes to stderr unbuffered, so a redirected log appears frozen at an
 # early line while the process is somewhere much later. That cost hours once.
 PY = "python -u"
+# -k python3 is not optional: papermill otherwise looks for the kernel named in
+# the notebook's own metadata, which is whoever last saved it and need not exist
+# in this environment. --log-output puts cell stdout in the log, where training
+# is otherwise silent for minutes at a time.
+PAPERMILL = "papermill --no-progress-bar --log-output -k python3"
+NOGPU = 'CUDA_VISIBLE_DEVICES="" '
 
 
 rule all:
     input:
-        f"{OUT}/02_ablation_merged.csv",
-        expand(f"{OUT}/04_fidelity_e{{epochs}}.csv", epochs=FID_BUDGETS),
-        f"{OUT}/03_sample_size_merged.csv",
-        f"{OUT}/01_kang_showcase.executed.ipynb",
+        f"{OUT}/verify.txt",
         f"{OUT}/benchmarks.csv",
+        f"{OUT}/units/figs/fig1_ranked_units.png",
 
 
-rule ablation:
-    """One architecture-ablation config (script 02).
+rule architecture:
+    """Act 1: which decoder actually uses the annotation (script 01).
 
-    Per-config jobs rather than the old two-lane split: every config re-seeds
-    before build_model, so running one alone is result-identical to running it
-    inside a set, and 8 independent jobs pack onto whichever card frees first.
+    Eight fits in one job: {real, permuted adjacency} x {shipped, pathway,
+    uncond, signed}. The permuted arm is the control the retired grid never
+    had -- it relabels genes, so every unit keeps its size, its name and the
+    entire pathway-by-pathway overlap matrix, and only which named genes share
+    a unit changes. An architecture that scores the same on both is not reading
+    the biology in the map.
+
+    Per arm it records the fit, the unit rank of the known target among all
+    1,615, the gene-level competitive rank of the same pathway -- kept here and
+    only here, as the evidence that read-out was annotation-blind -- and the
+    forward-pass identities, which must hold at float32 precision.
+
+    ~4 min an arm, so ~35 min for the job.
     """
     input:
-        script="02_architecture_ablation.py",
+        script="01_architecture.py",
         data=DATA,
         gmt=GMT,
     output:
-        f"{OUT}/ablation/{{config}}/summary.csv",
+        summary=f"{OUT}/architecture/summary.json",
+        arms=f"{OUT}/architecture/arms.csv",
+        units=f"{OUT}/architecture/units.csv",
     log:
-        f"{LOGS}/ablation_{{config}}.log",
+        f"{OUT}/architecture/run.log",
     benchmark:
-        f"{BENCH}/ablation_{{config}}.tsv"
-    threads: THREADS
-    resources:
-        gpu=1,
+        f"{OUT}/architecture/benchmark.tsv"
     params:
         epochs=EPOCHS,
-        data_folder=DATA_FOLDER,
-    shell:
-        ENV + GPU + " " + PY + " {input.script}"
-        " --device cuda --n-genes 0 --save-checkpoints"
-        " --epochs {params.epochs} --patience {params.epochs}"
-        " --data-folder {params.data_folder} --resources-dir {input.gmt}"
-        " --configs {wildcards.config}"
-        ' --run-dir "$(dirname {output})"'
-        " > {log} 2>&1"
-
-
-rule fidelity:
-    """One encoder-fidelity config at one epoch budget (script 04)."""
-    input:
-        script="04_encoder_fidelity_experiment.py",
-        data=DATA,
-        gmt=GMT,
-    output:
-        f"{OUT}/fidelity/e{{epochs}}/{{config}}/summary.csv",
-    log:
-        f"{LOGS}/fidelity_e{{epochs}}_{{config}}.log",
-    benchmark:
-        f"{BENCH}/fidelity_e{{epochs}}_{{config}}.tsv"
+        seed=SEED,
     threads: THREADS
     resources:
         gpu=1,
-    params:
-        data_folder=DATA_FOLDER,
     shell:
         ENV + GPU + " " + PY + " {input.script}"
-        " --device cuda --n-genes 0 --save-checkpoints"
-        " --epochs {wildcards.epochs} --patience {wildcards.epochs}"
-        " --data-folder {params.data_folder} --resources-dir {input.gmt}"
-        " --configs {wildcards.config}"
-        ' --run-dir "$(dirname {output})"'
-        " > {log} 2>&1"
+        " --epochs {params.epochs} --seed {params.seed} > {log} 2>&1"
 
 
-rule sample_size:
-    """One sample-size sweep: a whole (fraction x rep) grid (script 03).
+rule encoder_ablation:
+    """Act 1b: do the encoder-side options earn their place (script 01b).
 
-    Not split per fraction: summary.csv is the median across reps, computed
-    inside the run, and every rep shares one validation split.
+    `01_architecture.py` holds four options fixed in `BASE` while it varies the
+    conditioning path. This grid pins the conditioning at the selected scheme
+    and moves one of those four at a time, so `BASE` rests on evidence from the
+    current read-out rather than on an earlier grid whose metrics were retired.
+
+    Eight options x {real, permuted adjacency}: the reference, `normalize`
+    none and layer, fan-in init, the 2x2 of `nonneg_encoder` against
+    `standardize_input`, and a `dense_decoder` arm with no decoder mask at all.
+    The last is scored on fit and annotation worth alone, because with every
+    gene a member of every unit the unit statistic has no member set to sum
+    over. It is the arm that separates what the encoder mask is worth from what
+    the decoder mask is worth.
+
+    The `selected` arm reproduces `real_signed` from act 1, which is why both
+    scripts share one data loader: same genes, same split, same design.
+
+    ~4 min an arm, so ~65 min for the job.
     """
     input:
-        script="03_sample_size_experiment.py",
+        script="01b_encoder_ablation.py",
+        shared="01_architecture.py",
         data=DATA,
         gmt=GMT,
     output:
-        f"{OUT}/{{job}}/summary.csv",
+        summary=f"{OUT}/encoder_ablation/summary.json",
+        arms=f"{OUT}/encoder_ablation/arms.csv",
     log:
-        f"{LOGS}/{{job}}.log",
+        f"{OUT}/encoder_ablation/run.log",
     benchmark:
-        f"{BENCH}/{{job}}.tsv"
+        f"{OUT}/encoder_ablation/benchmark.tsv"
+    params:
+        epochs=EPOCHS,
+        seed=SEED,
     threads: THREADS
     resources:
         gpu=1,
-    params:
-        epochs=EPOCHS,
-        data_folder=DATA_FOLDER,
-        arch=ARCH,
-        n_genes=lambda w: SS_JOBS[w.job]["n_genes"],
-        reps=lambda w: SS_JOBS[w.job]["reps"],
-        fractions=lambda w: " ".join(str(f) for f in SS_JOBS[w.job]["fractions"]),
     shell:
         ENV + GPU + " " + PY + " {input.script}"
-        " --mode retrain --device cuda"
-        " --epochs {params.epochs} --patience {params.epochs}"
-        " {params.arch}"
-        " --data-folder {params.data_folder} --resources-dir {input.gmt}"
-        " --n-genes {params.n_genes} --reps {params.reps}"
-        " --sample-fractions {params.fractions}"
-        ' --run-dir "$(dirname {output})"'
-        " > {log} 2>&1"
+        " --epochs {params.epochs} --seed {params.seed} > {log} 2>&1"
 
 
-rule notebook:
-    """Execute the showcase notebook and keep the executed copy.
+rule saturation:
+    """Act 1c: is annotation worth confounded by saturation (script 01c).
 
-    papermill rather than `nbconvert --execute`, though both save outputs: it
-    injects parameters into the cell tagged `parameters`, so epochs and seed come
-    from config.yaml like every other job; it writes the notebook as it goes, so
-    a job killed part way leaves the dead cell marked `status: running`; and
-    --log-output puts cell stdout in the log.
+    `01b` rejected `init="fan_in"` because annotation worth falls from +14.52
+    to +8.07. Fan-in is also that grid's only low-saturation arm, at 43% pinned
+    against 71%, so the two explanations are collinear there and the rejection
+    had two readings.
 
-    -k python3 is not optional. papermill otherwise looks for the kernel named in
-    the notebook's own metadata, which need not exist in this environment.
+    This grid separates them with a knob that leaves the annotation alone:
+    scaling `dec_latent` and `cov_path` at initialisation scales the decoder
+    pre-activation and so moves how far units sit into the flat tail of `tanh`,
+    without changing which genes belong to which unit. Xavier at scales 1 to 8
+    gives the worth-against-saturation curve; fan-in at scales 1 to 4 is lifted
+    from 43% to 65% pinned and tested against it.
 
-    The notebook depends on the sample-size merge because its last figure reads
-    03_sample_size_merged.csv. It degrades gracefully when the file is absent,
-    but a full run should produce the figure rather than the fallback message.
+    Fan-in is raised toward xavier rather than xavier lowered toward fan-in
+    because 71% is xavier's converged floor here: a probe at scale 0.25 landed
+    at the same 71%, since training restores whatever pre-activation magnitude
+    the likelihood wants. Only scaling up sticks.
+
+    14 fits, ~55 min.
     """
     input:
-        nb="01_kang_showcase.ipynb",
+        script="01c_saturation.py",
+        shared="01_architecture.py",
         data=DATA,
         gmt=GMT,
-        sample_size=f"{OUT}/03_sample_size_merged.csv",
     output:
-        nb=f"{OUT}/01_kang_showcase.executed.ipynb",
+        summary=f"{OUT}/saturation/summary.json",
+        arms=f"{OUT}/saturation/arms.csv",
     log:
-        f"{LOGS}/notebook.log",
+        f"{OUT}/saturation_run.log",
     benchmark:
-        f"{BENCH}/notebook.tsv"
+        f"{OUT}/saturation/benchmark.tsv"
+    params:
+        epochs=EPOCHS,
+        seed=SEED,
     threads: THREADS
     resources:
         gpu=1,
+    shell:
+        ENV + GPU + " " + PY + " {input.script}"
+        " --epochs {params.epochs} --seed {params.seed}"
+        " --scales 1 2 4 8 --fanin-scales 1 2 4 > {log} 2>&1"
+
+
+rule units:
+    """Act 2: the read-out, over the model's own units (notebook 02).
+
+    One fit under the architecture act 1 selected, and the condition effect read
+    straight off `InformedVAE.pathway_contrast` -- one signed number per
+    annotated unit, cell-independent, with no counterfactual convention left to
+    choose because the covariate cannot reach `z`.
+
+    It reads act 1's `summary.json` for the permuted comparison rather than
+    recomputing it, so the two cannot disagree. The notebook asserts the four
+    checks that make its numbers readable: no inverted encoder unit, no negative
+    decoder weight, no unit writing against itself, and `pathway_contrast`
+    equal to the forward pass at float32 precision.
+
+    Replaces `01_kang_end_to_end.ipynb` and `01_kang_showcase.ipynb`, both of
+    which reported the gene-level test as the model's result.
+    """
+    input:
+        nb="02_kang_units.ipynb",
+        data=DATA,
+        gmt=GMT,
+        arch=f"{OUT}/architecture/summary.json",
+    output:
+        summary=f"{OUT}/units/summary.json",
+        contrasts=f"{OUT}/units/unit_contrasts.csv",
+        ig=f"{OUT}/units/ig_target.csv",
+        cells=f"{OUT}/units/target_cells.csv",
+        nb=f"{OUT}/units/run.ipynb",
+    log:
+        f"{OUT}/units/run.log",
+    benchmark:
+        f"{OUT}/units/benchmark.tsv"
     params:
         epochs=EPOCHS,
-        seed=config["seed"],
+        seed=SEED,
+    threads: THREADS
+    resources:
+        gpu=1,
     shell:
-        ENV + GPU + " papermill --no-progress-bar --log-output -k python3"
-        " -p smoke False"
+        ENV + GPU + " " + PAPERMILL
+        + " -p smoke False"
         " -p epochs {params.epochs}"
         " -p seed {params.seed}"
-        " {input.nb} {output.nb}"
-        " > {log} 2>&1"
+        " {input.nb} {output.nb} > {log} 2>&1"
 
 
-# --- collection ---------------------------------------------------------------
-# Ordinary outputs, so they rebuild when any input summary changes and are
-# skipped when nothing has.
+rule figures:
+    """The four figures, from the read-out's own tables (script 05).
 
+    CPU, seconds, no model and no dataset. It reads `unit_contrasts.csv`,
+    `ig_target.csv`, `target_cells.csv` and `summary.json`, which is why
+    figure work needs neither a GPU nor the 37 MB of counts.
 
-rule merge_ablation:
+    That separation is the point. `02_kang_units.ipynb` is an input of a GPU
+    rule, so editing it makes Snakemake delete the read-out and refit; this
+    script is an input of a CPU rule that writes nothing but pictures. Change
+    an axis here and the cost is ten seconds.
+
+      fig1_ranked_units        both ends of the unit ranking
+      fig2_target_activation   what the encoder reads per cell
+      fig3_ig_target           which genes the unit reads the pathway through
+      fig4_umap                a picture, carrying no claim
+    """
     input:
-        expand(f"{OUT}/ablation/{{config}}/summary.csv", config=ABL_CONFIGS),
+        script="05_figures.py",
+        units=f"{OUT}/units/unit_contrasts.csv",
+        ig=f"{OUT}/units/ig_target.csv",
+        cells=f"{OUT}/units/target_cells.csv",
+        summary=f"{OUT}/units/summary.json",
     output:
-        f"{OUT}/02_ablation_merged.csv",
-    run:
-        import pandas as pd
+        ranked=f"{OUT}/units/figs/fig1_ranked_units.png",
+        activation=f"{OUT}/units/figs/fig2_target_activation.png",
+        ig_target=f"{OUT}/units/figs/fig3_ig_target.png",
+        umap=f"{OUT}/units/figs/fig4_umap.png",
+    log:
+        f"{OUT}/units/figs/figures.log",
+    benchmark:
+        f"{OUT}/units/figs/benchmark.tsv"
+    threads: 4
+    shell:
+        ENV + NOGPU + PY + " {input.script} > {log} 2>&1"
 
-        df = pd.concat([pd.read_csv(f) for f in input], ignore_index=True)
-        df = df.sort_values("best_val_loss").reset_index(drop=True)
-        df.to_csv(output[0], index=False)
-        print(f"[merge] {len(df)} configs -> {output[0]}")
 
+rule verify:
+    """Re-derive every number `FINDINGS.md` quotes, from the outputs alone.
 
-rule merge_fidelity:
+    CPU, seconds, and the last thing `rule all` depends on, so a run that
+    finishes has been checked. The known answer is a hard gate here: the target
+    at unit rank 1 under the selected architecture and far down it under the
+    permuted map, a non-negative decoder, and sign agreement of exactly 1.
+    """
     input:
-        lambda w: expand(
-            f"{OUT}/fidelity/e{w.epochs}/{{config}}/summary.csv",
-            config=FID_CONFIGS,
-        ),
+        script="verify_findings.py",
+        findings="FINDINGS.md",
+        arch=f"{OUT}/architecture/summary.json",
+        encoder=f"{OUT}/encoder_ablation/summary.json",
+        saturation=f"{OUT}/saturation/summary.json",
+        units=f"{OUT}/units/summary.json",
     output:
-        f"{OUT}/04_fidelity_e{{epochs}}.csv",
-    run:
-        import pandas as pd
-
-        df = pd.concat([pd.read_csv(f) for f in input], ignore_index=True)
-        df.to_csv(output[0], index=False)
-        print(f"[merge] {len(df)} configs -> {output[0]}")
-
-
-rule merge_sample_size:
-    input:
-        expand(f"{OUT}/{{job}}/summary.csv", job=list(SS_JOBS)),
-    output:
-        f"{OUT}/03_sample_size_merged.csv",
-    run:
-        import pandas as pd
-
-        frames = []
-        for job, path in zip(SS_JOBS, input):
-            d = pd.read_csv(path)
-            # reps=1 runs keep a `rep` column; reps>1 runs report the median and
-            # drop it. Tag both so nobody reads a single draw as a 5-rep median.
-            d = d.drop(columns=[c for c in ("rep",) if c in d.columns])
-            d.insert(0, "job", job)
-            d.insert(1, "n_reps", SS_JOBS[job]["reps"])
-            d.insert(2, "n_genes", SS_JOBS[job]["n_genes"])
-            frames.append(d)
-        df = pd.concat(frames, ignore_index=True)
-        df.to_csv(output[0], index=False)
-        print(f"[merge] {len(df)} rows from {len(frames)} sweeps -> {output[0]}")
+        f"{OUT}/verify.txt",
+    threads: 2
+    shell:
+        ENV + NOGPU + PY + " {input.script} | tee {output}"
 
 
 rule collect_benchmarks:
     """Gather the per-job benchmark files into one table.
 
-    Answers what the grid costs to reproduce, and whether the thread budget is
-    right: a job whose cpu_time is far below threads x wall time spent it waiting
-    rather than working, which is the oversubscription the header warns about.
+    Answers what the experiment costs to reproduce, and whether the thread
+    budget is right: a job whose cpu_time is far below threads x wall time spent
+    it waiting rather than working, which is the oversubscription the header
+    warns about.
 
-    Benchmarks are globbed rather than declared as inputs, so a job adopted from
-    an earlier run, which has no benchmark file, neither fails the build nor
-    forces a rerun of a result that already exists.
+    Globbed rather than declared as inputs, so a job adopted from an earlier run
+    -- which has no benchmark file -- neither fails the build nor forces a rerun
+    of a result that already exists.
     """
     input:
-        f"{OUT}/02_ablation_merged.csv",
-        expand(f"{OUT}/04_fidelity_e{{epochs}}.csv", epochs=FID_BUDGETS),
-        f"{OUT}/03_sample_size_merged.csv",
-        f"{OUT}/01_kang_showcase.executed.ipynb",
+        f"{OUT}/architecture/summary.json",
+        f"{OUT}/encoder_ablation/summary.json",
+        f"{OUT}/saturation/summary.json",
+        f"{OUT}/units/summary.json",
+        f"{OUT}/units/figs/fig1_ranked_units.png",
     output:
         f"{OUT}/benchmarks.csv",
     run:
@@ -308,33 +354,25 @@ rule collect_benchmarks:
 
         import pandas as pd
 
-        expected = (
-            len(ABL_CONFIGS)
-            + len(FID_BUDGETS) * len(FID_CONFIGS)
-            + len(SS_JOBS)
-            + 1  # the notebook
-        )
         rows = []
-        for path in sorted(glob.glob(f"{BENCH}/*.tsv")):
+        for path in sorted(glob.glob(f"{OUT}/**/benchmark.tsv", recursive=True)):
             d = pd.read_csv(path, sep="\t")
             if d.empty:
                 continue
-            d.insert(0, "job", os.path.basename(path).removesuffix(".tsv"))
+            d.insert(0, "job", os.path.relpath(os.path.dirname(path), OUT)
+                     .replace("/", "_"))
             rows.append(d)
 
         if not rows:
             pd.DataFrame(columns=["job"]).to_csv(output[0], index=False)
-            print(
-                f"[bench] no benchmark files yet: all {expected} jobs were "
-                "adopted from earlier runs. Re-run a job to measure it."
-            )
+            print("[bench] no benchmark files yet: every job was adopted from "
+                  "an earlier run. Re-run a job to measure it.")
         else:
             df = pd.concat(rows, ignore_index=True)
             if "s" in df.columns:
                 df = df.sort_values("s", ascending=False)
             df.to_csv(output[0], index=False)
-            print(f"[bench] {len(df)} of {expected} jobs measured -> {output[0]}")
+            print(f"[bench] {len(df)} jobs measured -> {output[0]}")
             if "s" in df.columns:
-                print(f"[bench] total measured wall time: {df['s'].sum() / 3600:.2f} h")
-            if "max_rss" in df.columns:
-                print(f"[bench] peak RSS across jobs: {df['max_rss'].max():.0f} MB")
+                print(f"[bench] total measured wall time: "
+                      f"{df['s'].sum() / 60:.1f} min")

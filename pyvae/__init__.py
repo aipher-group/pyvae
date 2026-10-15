@@ -1,6 +1,7 @@
 from pyvae.bio import (
     InformedModelConfig,
     build_model_config,
+    permute_adjacency,
     swap_condition,
     sync_gexp_adj,
 )
@@ -12,6 +13,8 @@ from pyvae.interpret import (
     pathway_activity,
     pathway_unit_fidelity,
     pseudobulk_paired_test,
+    unit_contrast,
+    unit_sign_structure,
 )
 from pyvae.layers import InformedLinear
 from pyvae.models import InformedVAE
@@ -34,5 +37,8 @@ __all__ = [
     "integrated_gradients",
     "pathway_activity",
     "pathway_unit_fidelity",
+    "permute_adjacency",
     "pseudobulk_paired_test",
+    "unit_contrast",
+    "unit_sign_structure",
 ]

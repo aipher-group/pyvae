@@ -1,66 +1,38 @@
-# Kang analysis: the whole experiment grid, declaratively.
+# The Kang experiment, declaratively.
 #
-# The Snakefile turns every entry below into one job. Snakemake reruns a job only
-# when its summary.csv is missing, so a killed sweep resumes where it stopped and
-# a finished one is a no-op. Add a row here to add a job; nothing else changes.
-#
-# The config names must match the `CONFIGS` tables in scripts 02 and 04. They are
-# passed through --configs, whose argparse `choices=` rejects anything unknown, so
-# a rename in a script fails the job immediately instead of silently skipping it.
+# The Snakefile turns every entry below into one job. Snakemake reruns a job
+# only when its output is missing, so a killed run resumes where it stopped and
+# a finished one is a no-op.
 #
 # Measured on 3x A100 80GB, 64 cores.
 
 epochs: 250          # patience is pinned to epochs so cosine annealing completes
 threads_per_job: 21  # see the Snakefile header on thread oversubscription
 n_gpus: 3
-seed: 42             # the scripts default to this; the notebook is passed it explicitly
+seed: 42
 
-data: data/kang_counts_25k.h5ad
-gmt: resources/c2.cp.reactome.v7.5.1.symbols.gmt
 data_folder: data
+gmt: resources/c2.cp.reactome.v7.5.1.symbols.gmt
 
-# Architecture the notebook ships. 02 and 04 vary this internally; 03 holds it
-# fixed and needs it spelled out.
-arch: "--normalize batch --informed-decoder --nonneg-encoder --standardize-input"
+# The answer, fixed before anything runs. Kang et al. (2018) is PBMCs under
+# interferon-beta against control, so this is the unit a model that uses its
+# annotation should name. `verify_findings.py` treats it as a hard gate.
+target: REACTOME_INTERFERON_ALPHA_BETA_SIGNALING
+target_parent: REACTOME_INTERFERON_SIGNALING
 
-# --- 02 architecture ablation -------------------------------------------------
-# One job per config, so all 8 pack onto whichever GPU frees up first. Each
-# config re-seeds before build_model, so splitting them is result-identical to
-# running them in one process; that is why the old hand-balanced abl_a/abl_b
-# split is gone. ~14 min train + ~9 min metrics each.
-ablation_configs:
-  - baseline
-  - init_fan_in
-  - normalize_batch
-  - normalize_layer
-  - informed_decoder
-  - fan_in+norm
-  - norm+informed_dec
-  - all
-
-# --- 04 encoder fidelity ------------------------------------------------------
-# Two epoch budgets x 8 configs. Budgets are NOT nested: CosineAnnealingLR
-# (T_max=epochs) gives each budget its own schedule, so 100 and 250 are separate
-# experiments rather than a checkpoint of one. Compare final val loss within a
-# budget, never best_epoch across budgets.
-fidelity_budgets: [250, 100]
-fidelity_configs:
-  - baseline
-  - nonneg_only
-  - standardize_only
-  - both
-  - notebook_baseline
-  - notebook_nonneg
-  - notebook_standardize
-  - notebook_both
-
-# --- 03 sample size -----------------------------------------------------------
-# Full panel vs 5000 HVGs is the comparison that separates panel width from cell
-# count as the cause of the naive baseline's collapse, so both stay. The unit is
-# a whole (fraction x rep) grid because the median across reps is computed inside
-# the run; splitting it would have to re-derive the val split.
-sample_size:
-  ss_full_small:  { n_genes: 0,    reps: 5, fractions: [0.25, 0.1, 0.05, 0.025, 0.0125] }
-  ss_full_large:  { n_genes: 0,    reps: 1, fractions: [1.0, 0.5] }
-  ss_g5000_small: { n_genes: 5000, reps: 5, fractions: [0.25, 0.1, 0.05, 0.025, 0.0125] }
-  ss_g5000_large: { n_genes: 5000, reps: 1, fractions: [1.0, 0.5] }
+# `01_architecture.py` crosses {real, permuted annotation} with four covariate
+# schemes, so one job is eight fits of ~4 min each. One seed is enough here:
+# the separation this dataset is asked for is rank 1 against rank ~1,300, not a
+# variance.
+#
+# The previous grid -- 02_architecture_ablation.py, 03_sample_size_experiment.py,
+# 04_encoder_fidelity_experiment.py, 28 training runs over eight configurations,
+# two epoch budgets and two panel widths -- is gone. Its one surviving claim
+# (zero inverted encoder units) is now an assert inside 01, because
+# `nonneg_encoder` makes inversion unrepresentable rather than merely unlikely.
+# Its retired claims are retired for cause: `pathway_unit_fidelity` medians
+# measured distance from initialisation (an untrained non-negative model scores
+# 0.75 and the score FALLS with training), and the sample-size experiment's
+# model-against-naive win is reproduced by a permuted annotation. Neither bore
+# on the architecture. What that grid never had is 01's one real control: an arm
+# where the annotation itself is shuffled.

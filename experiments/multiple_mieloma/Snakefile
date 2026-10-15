@@ -1,0 +1,360 @@
+# Model-driven myeloma biology, in three acts.
+#
+#   cd experiments/multiple_mieloma
+#   pixi run all                 # or: snakemake -j 42 --resources gpu=3
+#
+# The workflow is the argument, in order:
+#
+#   1. architecture   01_architecture.py   which decoder actually uses the mask
+#   2. units          02_biology.ipynb     the biology, read over those units
+#   3. donor_test     03_donor_test.py     the same read-out, donors as the unit
+#      figures        04_figures.py        three pages, pure assembly
+#      verify         verify_findings.py   every number FINDINGS.md quotes
+#
+# **Why act 1 exists and runs first.** `InformedVAE` is named for a gene->pathway
+# mask, and until this rebuild no result used it. The shipped decoder computed
+# `logits = dec_out(tanh(dec_latent(z))) + cov_decoder(cov)` with `dec_out`
+# masked and `cov_decoder` dense and added *after* it, so every covariate
+# contrast was that dense term and nothing else. Measured: a permuted
+# gene->pathway map reproduced the old result at rho +0.97, and the model's own
+# units ranked the expected programme 1,614th and 1,615th of 1,615. Act 1 fits
+# eight arms per job -- {real, permuted} x {shipped, pathway, uncond, signed} --
+# and is what selects the architecture the other two acts use.
+#
+# `04_figures.py` compares the two studies' **outputs**. That is not the same as
+# pooling their **cells**, which this atlas cannot identify: 69% of its
+# non-cancer donors sit in studies that contain no patients, so a pooled disease
+# contrast would substantially be a contrast between studies and `study_id`
+# cannot be adjusted for without becoming collinear with the thing being
+# estimated. One fit per study, compared afterwards, is the whole design.
+#
+# There is no depth variant and no depth axis. Detection depth is handled by
+# conditioning on `depth_bin` inside the model, which is one word in
+# `config.yaml`, and by nothing else.
+#
+# The two concurrency numbers do different jobs:
+#
+#   gpu=3 caps concurrent GPU jobs at one per card. gpu_slot.sh then hands each
+#   job an actual device via flock, because Snakemake allocates a count and not
+#   a device id.
+#
+#   -j 42 caps total threads, and each job declares threads=21, so two GPU jobs
+#   run at once. Raise it and the read-out phase stalls: oversubscribed BLAS
+#   threads spin-wait at every barrier instead of working.
+#
+# Useful invocations, all from this directory:
+#   snakemake -n -q                 what would run, touching nothing
+#   snakemake figures               just the paper figures, no GPU
+#   snakemake verify                re-check FINDINGS.md against the outputs
+#   snakemake --summary             every output with its status
+#   snakemake --unlock              clear the lock left by a hard kill
+#   snakemake --rerun-incomplete    redo jobs whose outputs are half-written
+#   rm -rf outputs .snakemake       start completely from scratch
+
+import re
+
+
+configfile: "config.yaml"
+
+
+OUT = "outputs"
+
+THREADS = config["threads_per_job"]
+EPOCHS = config["epochs"]
+SEED = config["seed"]
+N_GPUS = config["n_gpus"]
+STUDIES = config["studies"]
+ARCH_SEEDS = config["architecture_seeds"]
+
+DATA = "data/Tcell.h5ad"
+META = "data/metadata-donor.csv"
+# Reactome is the encoder mask and defines the gene panel. Hallmark is NOT a
+# read-out any more: it is an input to `architecture` alone, where the
+# gene-level competitive test is scored purely as the evidence that the old
+# read-out was annotation-blind. resources/PROVENANCE.md records both roles.
+GMT = "resources/c2.cp.reactome.v7.5.1.symbols.gmt"
+HALLMARK = "resources/h.all.v7.5.1.symbols.gmt"
+LIB = "myeloma.py"
+INPUTS = [DATA, META, GMT, LIB]
+
+
+def arch_targets():
+    """One `summary.json` per (study, seed), seed 42 at the study root."""
+    out = []
+    for study, seeds in ARCH_SEEDS.items():
+        for seed in seeds:
+            prefix = "" if int(seed) == SEED else f"seed{int(seed)}/"
+            out.append(f"{OUT}/architecture/{study}/{prefix}summary.json")
+    return out
+
+
+ALL_SEEDS = sorted({int(s) for seeds in ARCH_SEEDS.values() for s in seeds})
+
+
+wildcard_constraints:
+    # re.escape matters: a study id is a literal, and an unescaped one would be
+    # read as a regex.
+    study="|".join(re.escape(s) for s in STUDIES),
+    # Either empty (the canonical seed, written at the study root) or a
+    # directory prefix. The trailing slash lives in the wildcard so one output
+    # pattern serves both.
+    seedpath="|".join([""] + [f"seed{s}/" for s in ALL_SEEDS if s != SEED]),
+
+
+# Thread limits have to reach the job as environment variables; the libraries
+# read them at import time, so setting them any later has no effect.
+ENV = (
+    f"N_GPUS={N_GPUS} "
+    "OMP_NUM_THREADS={threads} MKL_NUM_THREADS={threads} "
+    "OPENBLAS_NUM_THREADS={threads} NUMEXPR_NUM_THREADS={threads} "
+    "VECLIB_MAXIMUM_THREADS={threads} "
+)
+GPU = "bash gpu_slot.sh"
+# -k python3 is not optional: papermill otherwise looks for the kernel named in
+# the notebook's own metadata, which is whoever last saved it and need not exist
+# in this environment. --log-output puts cell stdout in the log, where training
+# is otherwise silent for minutes at a time.
+PAPERMILL = "papermill --no-progress-bar --log-output -k python3 --cwd ."
+# CPU-only jobs say so, rather than idling a card they will not use.
+NOGPU = 'CUDA_VISIBLE_DEVICES="" '
+
+
+rule all:
+    input:
+        f"{OUT}/verify.txt",
+        f"{OUT}/benchmarks.csv",
+
+
+rule architecture:
+    """Act 1: which decoder actually uses the annotation (script 01).
+
+    Eight fits per job: {real, permuted adjacency} x {shipped, pathway, uncond,
+    signed}. The permuted arm is the control the old grid never had -- it
+    relabels genes, so every unit keeps its size, its name and the entire
+    pathway-by-pathway overlap matrix, and only which named genes share a unit
+    changes. An architecture that scores the same on both is not reading the
+    biology in the map.
+
+    Per arm it records the fit, the unit rank of the target among all 1,615,
+    the gene-level competitive rank of the same pathway -- kept here and only
+    here, because "rank 1 in every arm including permuted" is the evidence the
+    old read-out was annotation-blind -- and four forward-pass identities that
+    must hold at float32 precision.
+
+    Four seeds on Zavidij (~2 min an arm) say whether the ranking is stable; one
+    on Foster (~25 min an arm) says the decision transfers to 125k cells.
+    """
+    input:
+        script="01_architecture.py",
+        lib=LIB,
+        inputs=INPUTS,
+        hallmark=HALLMARK,
+    output:
+        summary=f"{OUT}/architecture/{{study}}/{{seedpath}}summary.json",
+        arms=f"{OUT}/architecture/{{study}}/{{seedpath}}arms.csv",
+        units=f"{OUT}/architecture/{{study}}/{{seedpath}}units.csv",
+    log:
+        f"{OUT}/architecture/{{study}}/{{seedpath}}run.log",
+    benchmark:
+        f"{OUT}/architecture/{{study}}/{{seedpath}}benchmark.tsv"
+    params:
+        epochs=EPOCHS,
+        seed=lambda w: int(w.seedpath[4:-1]) if w.seedpath else SEED,
+    threads: THREADS
+    resources:
+        gpu=1,
+    shell:
+        ENV + GPU + " python {input.script} --study {wildcards.study}"
+        " --epochs {params.epochs} --seed {params.seed} > {log} 2>&1"
+
+
+rule units:
+    """Act 2: the biology, read over the model's own units (notebook 02).
+
+    One fit per study under the architecture act 1 selected. Identical
+    parameters for both studies, which is the point: every covariate is audited
+    before it enters, phenotype is the harmonised block that exists in both
+    datasets, and the atlas's own donor inclusion flag is honoured. If a
+    covariate cannot be identified in one study it is dropped in both, so the
+    two fits stay comparable.
+
+    The stage contrast is `InformedVAE.pathway_contrast` -- one signed number
+    per annotated unit, cell-independent, no enrichment test anywhere. The
+    notebook reads this rule's own `architecture/<study>/summary.json` for the
+    permuted comparison rather than recomputing it, so the two cannot disagree.
+
+    No depth twin: one architecture, one fit, one history.
+    """
+    input:
+        nb="02_biology.ipynb",
+        lib=LIB,
+        inputs=INPUTS,
+        arch=f"{OUT}/architecture/{{study}}/summary.json",
+    output:
+        summary=f"{OUT}/biology/{{study}}/summary.json",
+        contrasts=f"{OUT}/biology/{{study}}/unit_contrasts.csv",
+        design=f"{OUT}/biology/{{study}}/table1_design.csv",
+        drivers=f"{OUT}/biology/{{study}}/table2_drivers.csv",
+        agreement=f"{OUT}/biology/{{study}}/table3_lineage_agreement.csv",
+        audit=f"{OUT}/biology/{{study}}/covariate_audit.csv",
+        nb=f"{OUT}/biology/{{study}}/run.ipynb",
+    log:
+        f"{OUT}/biology/{{study}}/run.log",
+    benchmark:
+        f"{OUT}/biology/{{study}}/benchmark.tsv"
+    params:
+        epochs=EPOCHS,
+        seed=SEED,
+    threads: THREADS
+    resources:
+        gpu=1,
+    shell:
+        ENV + GPU + " " + PAPERMILL
+        + " -p study {wildcards.study}"
+        " -p epochs {params.epochs}"
+        " -p seed {params.seed}"
+        " {input.nb} {output.nb} > {log} 2>&1"
+
+
+rule donor_test:
+    """Act 3: the same read-out with the donor as the sampling unit (script 03).
+
+    The unit contrasts in act 2 are estimated from cells, and every donor sits
+    at exactly one stage, so they carry no donor-level variance: a large
+    contrast there is not evidence an effect would appear in new patients. This
+    supplies the missing sampling unit, and it is the only place in the
+    experiment where a p-value appears.
+
+    It refits the same architecture on the same cells with one change -- the
+    stage block is interacted with **donor** rather than cohort -- so each
+    donor's score is their own `cov_path` column minus the healthy donors' mean:
+    1,615 signed numbers, read straight off the weights. A model-free pseudobulk
+    score over the same units is computed alongside as an independent
+    cross-check.
+    """
+    input:
+        script="03_donor_test.py",
+        lib=LIB,
+        inputs=INPUTS,
+    output:
+        tests=f"{OUT}/donor_test/{{study}}/donor_test.csv",
+        scores=f"{OUT}/donor_test/{{study}}/donor_scores.csv",
+        summary=f"{OUT}/donor_test/{{study}}/summary.json",
+    log:
+        f"{OUT}/donor_test/{{study}}/run.log",
+    benchmark:
+        f"{OUT}/donor_test/{{study}}/benchmark.tsv"
+    params:
+        epochs=EPOCHS,
+        seed=SEED,
+    threads: THREADS
+    resources:
+        gpu=1,
+    shell:
+        ENV + GPU + " python {input.script} --study {wildcards.study}"
+        " --epochs {params.epochs} --seed {params.seed} > {log} 2>&1"
+
+
+rule figures:
+    """The three paper figures (script 04).
+
+    Pure assembly: it reads the three acts' own CSVs and writes figures. No GPU,
+    no model, no data file -- which is why it is a script and not a cell in the
+    notebook. The notebook is one study per run and cannot see both.
+
+      fig1_<study A>     one study, four panels
+      fig2_<study B>     the other study, identical layout and colour scale
+      fig3_comparison    what replicates and what does not
+
+    `fig_panel_data.csv` carries every plotted number, so `verify` checks the
+    prose against the figures rather than against a re-derivation.
+    """
+    input:
+        script="04_figures.py",
+        lib=LIB,
+        biology=expand(f"{OUT}/biology/{{study}}/summary.json", study=STUDIES),
+        contrasts=expand(f"{OUT}/biology/{{study}}/unit_contrasts.csv",
+                         study=STUDIES),
+        donor=expand(f"{OUT}/donor_test/{{study}}/summary.json", study=STUDIES),
+        arch=expand(f"{OUT}/architecture/{{study}}/summary.json", study=STUDIES),
+    output:
+        comparison=f"{OUT}/figures/fig3_comparison.pdf",
+        panel_data=f"{OUT}/figures/fig_panel_data.csv",
+    log:
+        f"{OUT}/figures/figures.log",
+    benchmark:
+        f"{OUT}/figures/benchmark.tsv"
+    threads: 4
+    shell:
+        ENV + NOGPU + "python {input.script} > {log} 2>&1"
+
+
+rule verify:
+    """Re-derive every number `FINDINGS.md` quotes, from the outputs alone.
+
+    CPU, seconds, and the last thing `rule all` depends on, so a run that
+    finishes has been checked. It also counts its own checks, which is what
+    stops a claim being quietly dropped from both the prose and the verifier.
+    """
+    input:
+        script="verify_findings.py",
+        findings="FINDINGS.md",
+        arch=arch_targets(),
+        biology=expand(f"{OUT}/biology/{{study}}/summary.json", study=STUDIES),
+        donor=expand(f"{OUT}/donor_test/{{study}}/summary.json", study=STUDIES),
+        panel_data=f"{OUT}/figures/fig_panel_data.csv",
+    output:
+        f"{OUT}/verify.txt",
+    threads: 2
+    shell:
+        ENV + NOGPU + "python {input.script} | tee {output}"
+
+
+rule collect_benchmarks:
+    """Gather the per-job benchmark files into one table.
+
+    Answers what the experiment costs to reproduce, and whether the thread
+    budget is right: a job whose cpu_time is far below threads x wall time spent
+    it waiting rather than working, which is the oversubscription the header
+    warns about.
+
+    Globbed rather than declared as inputs, so a job adopted from an earlier run
+    -- which has no benchmark file -- neither fails the build nor forces a rerun
+    of a result that already exists.
+    """
+    input:
+        arch=arch_targets(),
+        biology=expand(f"{OUT}/biology/{{study}}/summary.json", study=STUDIES),
+        donor=expand(f"{OUT}/donor_test/{{study}}/summary.json", study=STUDIES),
+        figures=f"{OUT}/figures/fig_panel_data.csv",
+    output:
+        f"{OUT}/benchmarks.csv",
+    run:
+        import glob
+        import os
+
+        import pandas as pd
+
+        expected = len(arch_targets()) + 2 * len(STUDIES) + 1
+        rows = []
+        for path in sorted(glob.glob(f"{OUT}/**/benchmark.tsv", recursive=True)):
+            d = pd.read_csv(path, sep="\t")
+            if d.empty:
+                continue
+            d.insert(0, "job", os.path.relpath(os.path.dirname(path), OUT)
+                     .replace("/", "_"))
+            rows.append(d)
+
+        if not rows:
+            pd.DataFrame(columns=["job"]).to_csv(output[0], index=False)
+            print(f"[bench] no benchmark files yet: all {expected} jobs were "
+                  "adopted from earlier runs. Re-run a job to measure it.")
+        else:
+            df = pd.concat(rows, ignore_index=True)
+            if "s" in df.columns:
+                df = df.sort_values("s", ascending=False)
+            df.to_csv(output[0], index=False)
+            print(f"[bench] {len(df)} of {expected} jobs measured -> {output[0]}")
+            if "s" in df.columns:
+                print(f"[bench] total measured wall time: "
+                      f"{df['s'].sum() / 60:.1f} min")

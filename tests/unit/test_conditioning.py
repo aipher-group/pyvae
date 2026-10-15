@@ -313,3 +313,33 @@ def test_swap_condition_raises_on_missing_column():
     cov = _fake_cov()
     with pytest.raises(KeyError, match="pd.get_dummies"):
         swap_condition(cov, from_label="control", to_label="typo")
+
+def _fake_multiblock_cov() -> pd.DataFrame:
+    """Covariates with two categorical blocks, as a multi-study design produces."""
+    return pd.DataFrame({
+        "cohort_Non": [1, 1, 0],
+        "cohort_MM": [0, 0, 1],
+        "study_id_A": [1, 0, 1],
+        "study_id_B": [0, 1, 0],
+    })
+
+
+def test_swap_condition_accepts_a_non_default_prefix():
+    cov = _fake_multiblock_cov()
+    cov_to = swap_condition(cov, from_label="Non", to_label="MM", prefix="cohort")
+    assert (cov_to["cohort_Non"] == 0).all()
+    assert (cov_to["cohort_MM"] == 1).all()
+
+
+def test_swap_condition_leaves_the_other_blocks_fixed():
+    """The point of the swap: flipping cohort is a contrast at fixed batch."""
+    cov = _fake_multiblock_cov()
+    cov_to = swap_condition(cov, from_label="Non", to_label="MM", prefix="cohort")
+    assert (cov_to["study_id_A"] == cov["study_id_A"]).all()
+    assert (cov_to["study_id_B"] == cov["study_id_B"]).all()
+
+
+def test_swap_condition_error_names_the_prefixed_column():
+    cov = _fake_multiblock_cov()
+    with pytest.raises(KeyError, match="cohort_typo"):
+        swap_condition(cov, from_label="Non", to_label="typo", prefix="cohort")

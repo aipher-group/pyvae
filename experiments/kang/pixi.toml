@@ -4,11 +4,20 @@
 #   pixi run all              # the whole grid, 3 GPUs
 #   pixi run plan             # dry run, touches nothing
 #
-# Separate from the repository's own pixi project on purpose. The root project is
-# a development environment: pyvae is installed editable, so the code under test
-# is whatever happens to be in the working tree. This one pins pyvae as a built
-# dependency instead, so a run is reproducible from the lock file alone and does
-# not silently change when someone edits pyvae/.
+# pyvae is installed EDITABLE here, so the environment tracks the working tree.
+# That is a deliberate reversal: this file used to pin a built wheel, on the
+# argument that a run should be reproducible from the lock file alone. It cannot
+# be, while the experiment and the library change together. The architecture this
+# experiment selects -- the covariate routed through the pathway layer, the
+# encoder's covariate route closed, the decoder's unit->gene weights positive --
+# lives in `pyvae`, and both experiments must run the same code for their results
+# to be comparable. Pinning a wheel forced the same surgery to be duplicated in
+# each experiment, which is exactly the drift the pin was meant to prevent.
+#
+# BEFORE PUBLICATION, pin it. Swap the `path` line in [pypi-dependencies] for the
+# `git` + `rev` form documented there, with the 40-character commit sha. That is
+# the only edit needed, and it restores reproducibility from the lock file with no
+# checkout at all.
 #
 # CUDA: pytorch 2.5.1/cuda120 matches the root project's cuda12 environment. That
 # is the newest conda-forge build that works on drivers capped at CUDA 12.4; 2.6+
@@ -53,26 +62,23 @@ ipykernel = "*"
 pytest = ">=8,<10"
 
 [pypi-dependencies]
-# pyvae, pinned by content rather than by whatever is in the working tree.
+# pyvae from the working tree, editable: see the header. An edit to pyvae/ takes
+# effect in this environment immediately, with no reinstall, which is required
+# while the library and the experiments are being changed together.
 #
-# The `path` form below builds a wheel from the checkout at install time, which
-# is what works while the branch is local only: a git dependency has to resolve
-# against a reachable remote, and sync.sh excludes .git/ so the GPU box has no
-# repository to resolve against either.
-#
-# Once the commit is pushed, swap the two lines. That is the only edit needed,
-# and it is what makes the environment reproducible from the lock file with no
-# checkout at all:
+# To pin for publication, replace the line below with:
 #
 #   pyvae = { git = "https://github.com/aipher-group/pyvae.git", rev = "<40-char sha>" }
 #
-pyvae = { path = "../..", editable = false }
+pyvae = { path = "../..", editable = true }
 
 [tasks]
 # Every path in the Snakefile and config.yaml is relative to this directory, so
 # these run from here and `snakemake` finds the Snakefile by name.
-all = "snakemake -j 63 --resources gpu=3"
+all = "snakemake -j 42 --resources gpu=2"
 plan = "snakemake -n -q"
+setup = "bash 00_setup.sh"
+verify = "python verify_findings.py"
 status = "snakemake --summary"
 report = "snakemake --report outputs/report.html"
 unlock = "snakemake --unlock"

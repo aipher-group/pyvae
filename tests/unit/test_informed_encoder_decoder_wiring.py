@@ -222,8 +222,17 @@ class TestInformedVAEWiring:
         assert isinstance(model.decoder.dec_out, InformedLinear)
         assert model.decoder.dec_out.mask_bias_enabled is False
 
-    def test_nonneg_encoder_reaches_encoder_only(self):
-        """Critical: nonneg must NOT reach the decoder, even with informed_decoder on."""
+    def test_nonneg_encoder_does_not_imply_nonneg_decoder(self):
+        """The two sides are separate flags and neither implies the other.
+
+        The original version of this test asserted that nonneg "must not reach
+        the decoder" because "a non-negative decoder cannot repress". That
+        reasoning is wrong: the pathway layer is a tanh and may be negative, so
+        a positive-weight `dec_out` still lowers a gene when its unit falls.
+        What the constraint actually does is move the direction from the weight
+        to the unit's activity, which is what gives a pathway's sign a meaning.
+        The invariant worth protecting is that the flags stay independent.
+        """
         adj = make_adj()
         model = InformedVAE(
             adj=adj,
@@ -231,13 +240,59 @@ class TestInformedVAEWiring:
             informed_decoder=True,
             nonneg_encoder=True,
         )
-        # Encoder's InformedLinear: nonneg on.
         assert model.encoder.informed.nonneg is True
-        # Decoder's InformedLinear (present because informed_decoder=True): nonneg OFF.
         assert isinstance(model.decoder.dec_out, InformedLinear)
         assert model.decoder.dec_out.nonneg is False, (
-            "nonneg must not reach the decoder; a non-negative decoder cannot repress."
+            "nonneg_encoder must not silently constrain the decoder; "
+            "nonneg_decoder is its own flag"
         )
+
+    def test_nonneg_decoder_reaches_decoder_only(self):
+        """And the mirror image: nonneg_decoder must not constrain the encoder."""
+        adj = make_adj()
+        model = InformedVAE(
+            adj=adj,
+            latent_dim=4,
+            informed_decoder=True,
+            nonneg_decoder=True,
+        )
+        assert model.decoder.dec_out.nonneg is True
+        assert model.encoder.informed.nonneg is False
+
+    def test_nonneg_decoder_can_still_lower_a_gene(self):
+        """The claim that replaced the old comment, asserted rather than argued.
+
+        With every unit->gene weight positive, a gene's logit must still fall
+        when its unit's activity falls. If this ever failed, the constraint
+        really would cost expressiveness and the old comment would have been
+        right.
+        """
+        adj = make_adj()
+        model = InformedVAE(
+            adj=adj,
+            latent_dim=4,
+            informed_decoder=True,
+            nonneg_decoder=True,
+        )
+        w = model.decoder.dec_out.effective_weight()
+        live = model.decoder.dec_out.mask > 0
+        assert (w[live] > 0).all(), "every live decoder weight should be positive"
+
+        h_up = torch.full((1, adj.shape[1]), 0.9)
+        h_down = torch.full((1, adj.shape[1]), -0.9)
+        out_up = model.decoder.dec_out(h_up)
+        out_down = model.decoder.dec_out(h_down)
+        annotated = live.any(dim=1)
+        assert (out_down[0, annotated] < out_up[0, annotated]).all(), (
+            "a positive-weight decoder must still lower an annotated gene when "
+            "its units fall"
+        )
+
+    def test_nonneg_decoder_requires_informed_decoder(self):
+        """A dense decoder has no units to orient, so the combination is refused."""
+        adj = make_adj()
+        with pytest.raises(ValueError, match="requires informed_decoder"):
+            InformedVAE(adj=adj, latent_dim=4, nonneg_decoder=True)
 
     def test_standardize_input_reaches_encoder_only(self):
         """standardize_input is an encoder-side fix; decoder input is a latent."""
@@ -389,3 +444,93 @@ class TestBackwardCompatibility:
         assert mu.shape == (8, 4)
         assert log_var.shape == (8, 4)
         assert h.shape == (8, 3)
+
+
+# ---------- Encoder mask ablation ----------
+
+
+class TestEncoderMaskAblation:
+    """`informed_encoder=False` drops the encoder mask and nothing else.
+
+    The decoder's mask has had an ablation flag since Phase 1c; the encoder's
+    did not, so "what is the encoder mask worth" had no measurement. These fix
+    the flag's meaning: same layer, same init, same normalisation, same sign
+    options, annotation removed.
+    """
+
+    def test_default_encoder_is_masked(self):
+        adj = make_adj()
+        model = InformedVAE(adj=adj, latent_dim=4)
+        assert model.informed_encoder is True
+        assert torch.equal(model.encoder.informed.mask, adj.T)
+
+    def test_dense_encoder_has_an_all_ones_mask(self):
+        adj = make_adj()
+        model = InformedVAE(adj=adj, latent_dim=4, informed_encoder=False)
+        mask = model.encoder.informed.mask
+        assert mask.shape == adj.T.shape
+        assert torch.equal(mask, torch.ones_like(mask))
+        # Orphan pathways keep a free bias too: with no mask they are no
+        # longer orphans, because every unit reads every gene.
+        assert torch.equal(model.encoder.informed.bias_mask,
+                           torch.ones(adj.shape[1]))
+
+    def test_masked_unit_ignores_non_member_genes(self):
+        # The property every encoder-side read-out rests on, and the one
+        # `integrated_gradients` reports: a unit's activation has exactly zero
+        # gradient with respect to a gene not annotated to it.
+        adj = make_adj()
+        enc = Encoder(adj=adj, latent_dim=4, n_cov=0)
+        x = torch.randn(8, adj.shape[0], requires_grad=True)
+        enc.informed(x)[:, 0].sum().backward()
+        g = x.grad.abs().sum(0)
+        members = adj[:, 0] > 0
+        assert torch.all(g[~members] == 0)
+        assert torch.all(g[members] > 0)
+
+    def test_dense_unit_reads_every_gene(self):
+        adj = make_adj()
+        enc = Encoder(adj=adj, latent_dim=4, n_cov=0, use_mask=False)
+        x = torch.randn(8, adj.shape[0], requires_grad=True)
+        enc.informed(x)[:, 0].sum().backward()
+        assert torch.all(x.grad.abs().sum(0) > 0)
+
+    def test_integrated_gradients_sees_the_same_difference(self):
+        from pyvae.interpret import integrated_gradients
+
+        adj = make_adj()
+        x = torch.randn(6, adj.shape[0]).abs()
+        members = adj[:, 0] > 0
+
+        masked = InformedVAE(adj=adj, latent_dim=4, seed=0)
+        a = integrated_gradients(masked, x=x, pathway_idx=0, steps=8)
+        assert torch.all(a[:, ~members] == 0)
+        assert torch.any(a[:, members] != 0)
+
+        dense = InformedVAE(adj=adj, latent_dim=4, seed=0,
+                            informed_encoder=False)
+        b = integrated_gradients(dense, x=x, pathway_idx=0, steps=8)
+        assert torch.any(b[:, ~members] != 0)
+
+    def test_the_two_masks_are_independent(self):
+        adj = make_adj()
+        model = InformedVAE(adj=adj, latent_dim=4, informed_decoder=True,
+                            informed_encoder=False)
+        enc_mask = model.encoder.informed.mask
+        dec_mask = model.decoder.dec_out.mask
+        assert torch.equal(enc_mask, torch.ones_like(enc_mask))
+        assert (dec_mask == 0).any(), "the decoder mask should still be a mask"
+
+    def test_nonneg_encoder_without_the_mask_raises(self):
+        adj = make_adj()
+        with pytest.raises(ValueError, match="requires informed_encoder"):
+            InformedVAE(adj=adj, latent_dim=4, nonneg_encoder=True,
+                        informed_encoder=False)
+
+    def test_the_new_flag_does_not_change_the_default_model(self):
+        adj = make_adj()
+        a = InformedVAE(adj=adj, latent_dim=4, seed=0)
+        b = InformedVAE(adj=adj, latent_dim=4, seed=0, informed_encoder=True)
+        sa, sb = a.state_dict(), b.state_dict()
+        assert sa.keys() == sb.keys()
+        assert all(torch.equal(sa[k], sb[k]) for k in sa)

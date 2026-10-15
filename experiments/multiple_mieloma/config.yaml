@@ -1,0 +1,67 @@
+# The experiment, declaratively.
+#
+# The Snakefile turns every entry below into one job. Snakemake reruns a job only
+# when its output is missing, so a killed run resumes where it stopped and a
+# finished one is a no-op.
+#
+# Measured on 3x A100 80GB, 64 cores.
+
+seed: 42
+epochs: 250          # patience is pinned to epochs so cosine annealing completes
+threads_per_job: 21  # see the Snakefile header on thread oversubscription
+n_gpus: 3
+
+# --- the two datasets ---------------------------------------------------------
+# The only two studies in the atlas that span all four disease stages with more
+# than one donor per arm. Fitted independently and never pooled: 69% of the
+# atlas's non-cancer donors sit in studies with no patients at all, so a pooled
+# disease contrast is substantially a contrast between studies. See FINDINGS.md,
+# "Decisions, dataset by dataset".
+#
+# Each fit trains on the whole T-cell compartment, not a lineage subset: the
+# stage covariate is interacted with lineage, so one model yields a stage
+# contrast inside CD4 and inside CD8 separately plus a pooled one. Subsetting to
+# one lineage first throws away 2 to 4 times the cells and makes the other
+# lineage unaskable.
+#
+#   study          donors Non/MGUS/SMM/MM   T cells   train
+#   Zavidij_2020   7 / 5 / 11 / 7             9,863   ~2 min
+#   Foster_2026     3 / 1 / 13 / 5           125,602   ~25 min
+#
+# Cell counts are after the atlas's own donor `analysed` flag is honoured, which
+# removes 3 Foster_2026 donors and nothing from Zavidij_2020.
+#
+# Adding a study here adds one job and nothing else, but a study missing a stage
+# cannot carry the four-stage ordering this experiment is about.
+studies:
+  - Zavidij_2020
+  - Foster_2026
+
+# --- act 1: the architecture decision -----------------------------------------
+# `01_architecture.py` crosses {real, permuted annotation} with four covariate
+# schemes, so one job is eight fits. On `Zavidij_2020` an arm costs ~2 min, so
+# four seeds are affordable and say whether the ranking is stable; on
+# `Foster_2026` an arm costs ~25 min, so one seed is all the result needs --
+# that study is there to show the decision transfers to 125k cells, not to
+# estimate a variance.
+#
+# Seed 42 writes to outputs/architecture/<study>/; any other seed writes to a
+# seed<n>/ subdirectory of it, so the canonical run is always at the study root
+# and `02_biology.ipynb` can read it without knowing the seed list.
+architecture_seeds:
+  Zavidij_2020: [42, 1, 2, 3]
+  Foster_2026: [42]
+
+# --- covariates ---------------------------------------------------------------
+# Per-cell quantile bins of genes detected. Detection depth IS a real confounder
+# here -- patients are sequenced deeper than controls -- and `depth_bin` passes
+# the notebook's covariate audit in both studies, so it is one word away from
+# entering the design. It is not on by default because neither source paper
+# corrects for depth, and a corrected result cannot be compared one-for-one with
+# their uncorrected claims.
+#
+# There is no longer a second depth-adjusted fit per study. Conditioning on
+# `depth_bin` moved the previous read-out by less than 0.02 in z, and carrying a
+# twin of every fit to re-answer that doubled the cost of the whole workflow for
+# a settled question. One architecture, one fit per study, one history.
+depth_bins: 5
