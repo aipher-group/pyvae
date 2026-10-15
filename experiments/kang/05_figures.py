@@ -231,20 +231,22 @@ def fig3_ig_target(d: dict, figs: Path) -> None:
     # size of the Reactome set before the panel was intersected with it.
     even = 1.0 / float(d["units"].loc[TARGET, "n_genes"])
 
-    fig, ax = plt.subplots(figsize=(6.6, 0.28 * len(t) + 1.1))
+    fig, ax = plt.subplots(figsize=(5.9, 0.26 * len(t) + 1.3))
     ax.barh(range(len(t)), t["share"].to_numpy(),
             color=[C_ORANGE if m else C_FAINT for m in t["is_member"]],
             edgecolor=C_GREY, linewidth=0.4, height=0.7)
-    ax.axvline(even, color=C_GREY, ls="--", lw=1)
+    ax.axvline(even, color="#4a4a46", ls="--", lw=1.0)
     ax.annotate("equal share", (even, len(t) - 0.2), fontsize=7,
                 color="#52514e", ha="center", va="bottom")
     ax.set_yticks(range(len(t)))
-    ax.set_yticklabels(t.index, fontsize=8)
-    ax.set_xlabel("share of total |attribution|")
+    ax.set_yticklabels(t.index, fontsize=7)
+    ax.set_xlabel("share of total |attribution|", fontsize=9)
     ax.tick_params(length=0)
     ax.grid(axis="y", visible=False)
-    ax.set_title(f"{TARGET.replace('REACTOME_', '').replace('_', ' ')}: "
-                 "encoder sensitivity (filled = annotated member)", fontsize=10)
+    ax.grid(axis="x", color=C_FAINT, lw=0.5, alpha=0.7, zorder=0)
+    ax.set_title(f"{TARGET.replace('REACTOME_', '').replace('_', ' ')}\n"
+                 "encoder sensitivity (filled = annotated member)",
+                 fontsize=10, pad=10, loc="left")
     save(fig, figs / "fig3_ig_target.png")
 
 
