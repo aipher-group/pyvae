@@ -262,31 +262,43 @@ def fig4_umap(d: dict, figs: Path) -> None:
 
     centre = float(np.median(pre))
     span = float(np.nanquantile(np.abs(pre - centre), 0.99)) or 1e-9
-    fig, axes = plt.subplots(1, 3, figsize=(15.0, 4.4))
+    fig, axes = plt.subplots(1, 3, figsize=(7.5, 3.3))
     for ax, cond in zip(axes[:2], ["control", "stimulated"]):
         m = (cells["condition"] == cond).to_numpy()
-        ax.scatter(u[~m, 0], u[~m, 1], s=1.2, c=C_FAINT, linewidths=0)
-        sct = ax.scatter(u[m, 0], u[m, 1], s=2.2, c=pre[m], cmap=DIVERGING,
+        ax.scatter(u[~m, 0], u[~m, 1], s=0.8, c=C_FAINT, linewidths=0)
+        sct = ax.scatter(u[m, 0], u[m, 1], s=1.4, c=pre[m], cmap=DIVERGING,
                          vmin=centre - span, vmax=centre + span, linewidths=0)
-        ax.set_title(f"{cond}   {int(m.sum()):,} cells", fontsize=10)
-    fig.colorbar(sct, ax=axes[1], shrink=0.8, label="unit pre-activation")
+        ax.set_title(f"{cond}   {int(m.sum()):,} cells", fontsize=9)
+    cb = fig.colorbar(sct, ax=axes[1], shrink=0.8, label="unit pre-activation")
+    cb.ax.yaxis.label.set_fontsize(8)
+    cb.ax.tick_params(labelsize=7)
+
+    # FCGR3A+ Monocytes' median sits on top of Dendritic cells' median in UMAP
+    # space; lift the FCGR3A+ label up so Dendritic cells can stay at its own
+    # cluster.
+    LABEL_OFFSETS = {
+        "FCGR3A+ Monocytes": (0.0, 0.5),
+    }
     for ct in order:
         m = (cells["cell_type"] == ct).to_numpy()
-        axes[2].scatter(u[m, 0], u[m, 1], s=1.2, c=C_FAINT, linewidths=0)
-        axes[2].annotate(ct, (np.median(u[m, 0]), np.median(u[m, 1])),
-                         fontsize=7.5, ha="center", fontweight="bold",
+        axes[2].scatter(u[m, 0], u[m, 1], s=0.8, c=C_FAINT, linewidths=0)
+        x0, y0 = float(np.median(u[m, 0])), float(np.median(u[m, 1]))
+        dx, dy = LABEL_OFFSETS.get(ct, (0.0, 0.0))
+        axes[2].annotate(ct, (x0 + dx, y0 + dy),
+                         fontsize=6.5, ha="center", fontweight="bold",
                          color="#0b0b0b",
-                         bbox=dict(boxstyle="round,pad=0.18", fc="white",
-                                   ec="none", alpha=0.8))
-    axes[2].set_title("cell type", fontsize=10)
+                         bbox=dict(boxstyle="round,pad=0.14", fc="white",
+                                   ec="none", alpha=0.85))
+    axes[2].set_title("cell type", fontsize=9)
     for ax in axes:
         ax.set_xticks([])
         ax.set_yticks([])
         ax.grid(False)
-    fig.suptitle(f"{TARGET.replace('REACTOME_', '').replace('_', ' ')}: the "
-                 "encoder's read per cell, standard scanpy frame", y=1.02)
+    fig.suptitle(f"{TARGET.replace('REACTOME_', '').replace('_', ' ')}\n"
+                 "the encoder's read per cell, standard scanpy frame",
+                 fontsize=10, y=0.99)
+    fig.subplots_adjust(top=0.78, bottom=0.04, left=0.02, right=0.95, wspace=0.1)
     save(fig, figs / "fig4_umap.png")
-
 
 # --------------------------------------------------------------------------- #
 def main() -> None:
