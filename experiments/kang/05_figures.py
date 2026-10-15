@@ -185,7 +185,7 @@ def fig2_target_activation(d: dict, figs: Path) -> None:
     seed = int(d["summary"]["seed"])
     sat_line = float(np.arctanh(0.99))
 
-    fig, ax = plt.subplots(figsize=(1.05 * len(order) + 2.2, 3.8))
+    fig, ax = plt.subplots(figsize=(5.9, 3.6))
     rng = np.random.default_rng(seed)
     for i, ct in enumerate(order):
         for off, (cond, colour) in enumerate([("control", C_BLUE),
@@ -195,26 +195,27 @@ def fig2_target_activation(d: dict, figs: Path) -> None:
             if not len(v):
                 continue
             xpos = i + (off - 0.5) * 0.34
-            ax.scatter(xpos + rng.normal(0, 0.045, len(v)), v, s=1.6, c=colour,
+            ax.scatter(xpos + rng.normal(0, 0.045, len(v)), v, s=1.4, c=colour,
                        alpha=0.35, linewidths=0)
             ax.plot([xpos - 0.13, xpos + 0.13], [np.median(v)] * 2,
                     color="#0b0b0b", lw=1.6, solid_capstyle="butt", zorder=5)
     ax.set_xticks(range(len(order)))
-    ax.set_xticklabels(order, rotation=30, ha="right", fontsize=8)
-    ax.axhline(sat_line, color="#0b0b0b", lw=1.0, ls="--")
+    ax.set_xticklabels(order, rotation=30, ha="right", fontsize=7)
+    ax.axhline(sat_line, color="#4a4a46", lw=1.0, ls="--")
     ax.annotate("tanh saturates above here", (len(order) - 0.5, sat_line),
-                fontsize=7.5, va="bottom", ha="right", color="#52514e")
-    ax.set_ylabel("unit pre-activation")
+                fontsize=7, va="bottom", ha="right", color="#52514e")
+    ax.set_ylabel("unit pre-activation", fontsize=9)
     ax.grid(axis="x", visible=False)
     handles = [plt.Line2D([], [], marker="o", ls="", color=c, label=l,
                           markersize=5)
                for c, l in [(C_BLUE, "control"), (C_ORANGE, "stimulated")]]
-    ax.legend(handles=handles, loc="upper right", fontsize=8)
-    ax.set_title(f"{TARGET.replace('REACTOME_', '').replace('_', ' ')}: what "
-                 "the encoder reads per cell, every cell held at control\n(bar "
-                 "= median; the covariate adds "
-                 f"{d['units'].loc[TARGET, 'delta_pre']:+.3f} on top of all of "
-                 "them)", fontsize=9.5)
+    ax.legend(handles=handles, loc="upper right", bbox_to_anchor=(1.0, 0.88),
+              fontsize=7, frameon=False)
+    ax.set_title(f"{TARGET.replace('REACTOME_', '').replace('_', ' ')}\n"
+                 f"what the encoder reads per cell, every cell held at control\n"
+                 f"(bar = median; the covariate adds "
+                 f"{d['units'].loc[TARGET, 'delta_pre']:+.3f} on top of all of them)",
+                 fontsize=9, pad=10, loc="left")
     save(fig, figs / "fig2_target_activation.png")
 
 
