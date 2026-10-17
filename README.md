@@ -2,11 +2,11 @@
 
 **Informed Variational Autoencoder (iVAE) for gene expression, in PyTorch.**
 
-`pyvae` implements a VAE whose encoder is *biologically constrained*: each gene
-can only influence the pathways that contain it, according to the
-[Reactome](https://reactome.org/) database. The result is a latent space whose
-dimensions correspond to interpretable biological pathways rather than opaque
-features.
+`pyvae` implements a VAE that carries a gene-set annotation on both sides: each
+encoder unit reads only the genes of one [Reactome](https://reactome.org/)
+pathway, and each decoder unit writes only to them. Conditioning enters in
+pathway coordinates, so a covariate contrast is one signed number per pathway
+rather than a quantity the annotation never touches.
 
 [![CI](https://github.com/aipher-group/pyvae/actions/workflows/ci.yml/badge.svg)](https://github.com/aipher-group/pyvae/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -25,27 +25,41 @@ $$
 \text{ELBO} = \mathbb{E}_{q(z|x)}[\log p(x|z)] - \text{KL}(q(z|x)\,\|\,p(z))
 $$
 
-Gene expression is high-dimensional (~20 000 genes) but structured: genes act
-together in *pathways*. `pyvae` restricts the encoder's first layer so only the
-gene → pathway connections that exist in Reactome are allowed. A binary mask
-enforces this on the weight matrix: $W_{\text{eff}} = W \odot M$, where
-$M_{ji}=1$ iff gene $i$ belongs to pathway $j$. This reduces parameters, injects
-prior biological knowledge, and makes each latent node interpretable as a
-pathway.
+Gene expression is high-dimensional (about 20,000 genes) but structured: genes
+act together in *pathways*. `pyvae` masks the first layer so only the gene to
+pathway edges in Reactome carry weight, $W_{\text{eff}} = W \odot M$ with
+$M_{ji}=1$ iff gene $i$ belongs to pathway $j$. On the Kang panel that leaves
+0.55% of a dense layer's weights, and it keeps a per-gene attribution specific
+to one pathway.
+
+Masking the encoder does not on its own make a latent dimension a pathway, since
+`z` is a dense mixture of those units. What a covariate contrast reads is the
+decoder. Measured against a shuffled annotation of identical set sizes and
+overlap, the encoder mask alone is worth +3.24 nats of held-out loss and masking
+the decoder as well raises that to +14.52. Both masks are flags, and
+[`experiments/DRAFT.md`](experiments/DRAFT.md) reports each.
 
 
-## Validation benchmark
+## Validation
 
-The canonical end-to-end validation of pyvae lives in
-[`experiments/kang/`](experiments/kang/): a Snakemake grid of 28 training jobs
-on the Kang 2018 PBMC interferon-β dataset, plus a showcase notebook that
-examines one model closely with saturation, unit fidelity, decoder-side
-pathway ranking, gene attribution, and counterfactual prediction. The sweep
-exercises the architecture ablation, the encoder-fidelity constraints, and
-the sample-size behaviour against a model-free baseline. See
-[`experiments/kang/README.md`](experiments/kang/README.md) for how to run it
-and [`experiments/kang/FINDINGS.md`](experiments/kang/FINDINGS.md) for what
-the results show.
+Two Snakemake pipelines under [`experiments/`](experiments/) produce the paper
+draft, [`experiments/DRAFT.md`](experiments/DRAFT.md).
+
+[`experiments/kang/`](experiments/kang/) is the known-answer check. Kang 2018
+PBMCs under interferon-beta fix the right pathway before anything runs. Three
+grids totalling 40 fits then decide the architecture on evidence: where the
+covariate enters, whether the options held fixed matter, and whether
+the measure is confounded by how far units sit in the flat tail of `tanh`. The
+read-out puts `REACTOME_INTERFERON_ALPHA_BETA_SIGNALING` at rank 25 of
+1,615 units with its Reactome parent at 3.
+
+[`experiments/multiple_mieloma/`](experiments/multiple_mieloma/) applies the
+selected architecture to bone-marrow T cells across the myeloma precursor
+sequence in two independent cohorts.
+
+Each pipeline ends in a verifier that re-derives every number its `FINDINGS.md`
+quotes and asserts its own check count, 87 for Kang and 88 for myeloma, so a
+claim cannot leave the prose and the checks at the same time.
 
 ## Features
 
@@ -58,17 +72,27 @@ configure it through constructor kwargs. `likelihood` picks between
 `"gaussian"` (MSE on log1p-normalized expression, the default) and `"nb"` (a
 negative-binomial likelihood on raw counts, implemented scVI-style in pure
 PyTorch with no `scvi-tools` dependency). `n_cov` sets the width of an
-auxiliary one-hot covariate (cell type, condition, or both), which the model
-concatenates into the encoder and decoder to support conditional inference.
+auxiliary one-hot covariate (cell type, condition, or both). Where that
+covariate enters is a separate choice, and it decides what a conditional
+contrast can mean.
 
- The encoder has four optional constraints: `init="fan_in"` for per-unit Xavier
-scaling, `normalize="batch"` for BatchNorm on the pre-activation (which keeps
-units off tanh's flat tail), `nonneg_encoder=True` for a softplus
-reparameterisation that removes sign freedom (so a unit cannot encode its
-pathway upside-down), and `standardize_input=True` for BatchNorm on the input
-(which removes scale freedom). `informed_decoder=True` applies the same
-Reactome mask symmetrically on the decoder, which is what enables faithful
-counterfactual prediction.
+The encoder takes `init="fan_in"` for per-unit scaling, `normalize="batch"` for
+BatchNorm on the pre-activation, `nonneg_encoder=True` for a softplus
+reparameterisation that removes sign freedom, `standardize_input=True` for
+BatchNorm on the input, and `informed_encoder=False` to drop its mask
+altogether. The decoder takes `informed_decoder=True` for the same mask applied
+symmetrically, and `nonneg_decoder=True` so that a unit rising raises its member
+genes, which is what gives a pathway's sign a meaning.
+
+Two further flags decide where a covariate enters, and they decide whether the
+annotation reaches a conditional contrast at all. `cov_mode="pathway"` routes it
+through an `(n_pathways, n_cov)` matrix inside the decoder's nonlinearity
+instead of a dense per-gene term added after the mask, and
+`cov_in_encoder=False` closes the encoder's covariate route so that term is the
+whole conditional effect. Under both, `InformedVAE.pathway_contrast(cov_a,
+cov_b)` returns one signed number per pathway, and it raises wherever that
+number would be incomplete, naming `unit_contrast` as the read-out that measures
+both routes.
 
 ### Training
 
@@ -78,41 +102,53 @@ warmup, AdamW with decoupled weight decay, cosine LR annealing, and
 best-weight restore.
 
  `train_ivae_modern` also accepts `cov_train` and `cov_val` to thread one-hot
-covariates through both encoder and decoder — required for the counterfactual
-read-out and recommended whenever cell composition varies between conditions.
+covariates through the model, which the conditional read-out requires and which
+is advisable whenever cell composition varies between conditions.
 Datasets are moved to the training device once at the start of training, so
 batches cost a device-side gather rather than a host-to-device copy per
 epoch; a full-panel Kang run takes about 4 minutes on a single A100.
 
 ### Interpretation
 
-`InformedVAE.predict_counterfactual` (NB models only) encodes a cell under
-one covariate and decodes it under another, returning predicted counts. It
-uses the posterior mean rather than a stochastic sample, so the prediction
-stays deterministic, which is what you want for a question like "what would
-this control cell look like if stimulated?" `bayes_factor_da` computes a
-signed Bayes factor per pathway between two groups of cells, based on
-Monte-Carlo pairing of raw pathway activations. `integrated_gradients`
-attributes a single pathway's activation back to each input gene
-(Sundararajan et al., 2017), implemented in pure PyTorch.
+`pathway_contrast` is the conditional read-out, and `unit_contrast` decomposes
+the same quantity per unit: the shift each unit takes, what reaches its member
+genes, and how much of the gene-level change passes through the mask rather
+than around it. `unit_sign_structure` reports whether a unit has a direction at
+all, which under a freely signed decoder it does not. `permute_adjacency`
+relabels gene rows while preserving every set size, every gene's degree and the
+whole pathway-by-pathway overlap matrix, which is the control that separates
+the annotation from its shape. `integrated_gradients` attributes one unit's
+activation back to each input gene (Sundararajan et al., 2017); under the
+encoder mask a gene outside the set gets exactly zero.
 
+`predict_counterfactual` (NB models only) encodes a cell under one covariate and
+decodes it under another, using the posterior mean so the prediction is
+deterministic. Read it with care under `cov_mode="gene"`: the masked term then
+cancels between the two sides and what is left is one column difference of an
+unannotated matrix, which is the defect `experiments/DRAFT.md` is about.
 
-Four pathway-level read-outs cover the gap between a VAE and a traditional
-pathway-ranking workflow. `pathway_unit_fidelity` correlates each unit's
-activation against the mean z-scored expression of its own member genes, so
-you can audit whether a unit actually represents the pathway named after it
-(and whether its sign is correct). `differential_expression` samples
-posterior per-gene differential expression between two groups (Boyeau et
-al. 2019), with observed-detection filtering so decoder-confident but
-barely-observed phantom genes do not float to the top of the ranking.
-`pathway_activity` runs a tie-corrected competitive Mann-Whitney rank test
-of a pathway's member genes against the rest of the panel on the output of
-`differential_expression`, which is the ranking most biologists actually
-want; it also reports `top_gene_share` so you can tell when a hit is really
-one gene wearing a pathway's name. `pseudobulk_paired_test` collapses cells
-to donor-level pseudobulk and runs a paired Wilcoxon per gene — the Squair
-et al. 2021 correction for cell-level pseudo-replication, which inflates
-cell-level p-values badly when donors are the real unit of replication.
+The gene-level read-outs remain, as baselines and for model-free comparison.
+`differential_expression` samples posterior per-gene differential expression
+between two groups (Boyeau et al. 2019), with observed-detection filtering so
+decoder-confident but barely-observed genes do not dominate the ranking.
+`pathway_activity` runs a tie-corrected competitive Mann-Whitney test of a
+pathway's member genes against the rest of the panel on that output, and reports
+`top_gene_share` so a hit driven by a single gene is visible.
+`pseudobulk_paired_test` collapses cells to donor-level pseudobulk and runs a
+paired Wilcoxon per gene, the Squair et al. 2021 correction for cell-level
+pseudo-replication.
+
+Two read-outs are retired from our own pipelines, and a third is kept only as a
+control. `pathway_unit_fidelity` measures distance from initialisation rather
+than fidelity: an untrained non-negative model scores about 0.75 and the score
+falls with training, so it detects inverted units and is not a quality gate
+([`experiments/kang/README.md`](experiments/kang/README.md) gives the
+arithmetic). `bayes_factor_da` compares observed groups of cells, so it is
+composition-confounded wherever those groups differ in cell-type mixture, and a
+covariate contrast answers the same question conditionally. `pathway_activity`
+ranks the right pathway first in all eight architecture arms of the Kang
+benchmark, including every arm whose gene-to-pathway map is shuffled, so there
+it is evidence about the read-out rather than a result from the model.
 
 ### Data helpers
 
@@ -139,20 +175,19 @@ pixi add pyvae                         # into a pixi project
 hardware you can accelerate depends entirely on which PyTorch build your
 install command pulls. Use this table to pick the right path:
 
-| Your machine | `pip install pyvae` | `conda install -c conda-forge pyvae` | Accelerated out of the box? |
+| Your machine | `pip install pyvae` | `conda install -c conda-forge pyvae` | Accelerated without further configuration? |
 |---|---|---|---|
 | **NVIDIA CUDA (Linux/Windows)** | default `torch` wheel is the CUDA build | conda-forge ships CUDA `pytorch` variants | ✅ yes, on both |
 | **Apple Silicon (macOS arm64)** | standard wheel includes **MPS** (Metal) | conda-forge osx-arm64 build includes MPS | ✅ yes (use `device="mps"`) |
 | **AMD ROCm (Linux)** | gets the CUDA wheel, which won't drive an AMD GPU | conda-forge has **no ROCm** builds → CPU only | ❌ no (see ROCm steps below) |
 | **Intel macOS / generic CPU** | CPU wheel | CPU build | n/a (CPU only) |
 
-**CUDA and Apple-Silicon users need no extra steps.** Verify at runtime with
+**CUDA and Apple-Silicon users require no further configuration.** Verify at runtime with
 `python -c "import torch; print(torch.cuda.is_available())"` (CUDA) or
 `torch.backends.mps.is_available()` (macOS).
 
 **AMD ROCm users must install torch from PyTorch's ROCm index.** ROCm wheels
-exist neither on PyPI nor on conda-forge, so `conda install` is a dead end
-for AMD GPUs. Install ROCm torch *first*, then pyvae; pip then sees the
+exist neither on PyPI nor on conda-forge, so `conda install` cannot serve AMD GPUs. Install ROCm torch *first*, then pyvae; pip then sees the
 constraint already satisfied and leaves torch alone:
 
 ```bash
@@ -201,8 +236,22 @@ model, history = pyvae.train_ivae(
     epochs=500, batch_size=32, patience=50, lr=1e-4, device="cpu",
 )
 
-# 5. Encode new cells — `h` is the interpretable pathway activation
+# 5. Encode new cells. `h` holds one activation per pathway unit
 z_mean, z_log_var, h = model.encode(torch.tensor(x_val.values, dtype=torch.float32))
+```
+
+For a conditional contrast, build the model with the architecture the
+experiments selected and read the effect straight off the decoder:
+
+```python
+model = pyvae.InformedVAE(
+    adj=adj, latent_dim=adj.shape[1] // 2, likelihood="nb", n_cov=cov.shape[1],
+    normalize="batch", standardize_input=True, nonneg_encoder=True,
+    informed_decoder=True, nonneg_decoder=True,     # the mask on both sides
+    cov_mode="pathway", cov_in_encoder=False,       # the covariate inside it
+)
+# ... train with pyvae.train_ivae_modern(..., cov_train=..., cov_val=...)
+contrast = model.pathway_contrast(cov_control, cov_stimulated)  # (n_pathways,)
 ```
 
 ## Development
@@ -265,14 +314,17 @@ pyvae/
 ├── models.py      InformedVAE (composition of components)
 ├── train.py       training loops: train_ivae, train_ivae_modern
 ├── datasets.py    Kang dataset loader
-├── bio.py         Reactome adjacency helpers, swap_condition
-├── interpret.py   bayes_factor_da, integrated_gradients,
-│                   pathway_unit_fidelity, differential_expression,
-│                   pathway_activity, pseudobulk_paired_test
+├── bio.py         Reactome adjacency helpers, swap_condition,
+│                   permute_adjacency
+├── interpret.py   unit_contrast, unit_sign_structure, integrated_gradients,
+│                   differential_expression, pathway_activity,
+│                   pseudobulk_paired_test, and two retired read-outs
 tests/             contract + unit tests
 conda-recipe/      conda-forge recipe + submission guide
-experiments/kang/  canonical validation benchmark (Kang 2018 IFN-β PBMCs);
-                   see experiments/kang/README.md and FINDINGS.md
+experiments/
+├── DRAFT.md       the paper: methods, results, discussion
+├── kang/          known-answer validation (Kang 2018 IFN-beta PBMCs)
+└── multiple_mieloma/   application to the myeloma precursor sequence
 ```
 
 ## Acknowledgements
