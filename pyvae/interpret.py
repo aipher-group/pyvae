@@ -1397,3 +1397,312 @@ def pseudobulk_paired_test(
     ).drop(columns="_abs_lfc")
 
     return df
+
+
+def unit_sign_structure(model, min_genes: int = 10):
+    """Does a pathway unit have a direction? Measures it, per unit.
+
+    ``nonneg_encoder`` makes the encoder's gene->unit weights positive, so genes
+    rising implies the unit rising. There is no counterpart on the decoder unless
+    ``nonneg_decoder=True``, and without it ``dec_out`` has free signs: a unit
+    rising raises some of its member genes and lowers others, so "this pathway
+    went up" does not say which way its genes moved.
+
+    The obvious cheap fix -- flip each unit by the sign of its weight sum and
+    read it post hoc -- needs most units to be nearly all one sign. These numbers
+    say whether that is available. Measured on trained fits it is not: the
+    per-unit fraction of positive weights has median exactly 0.500, only 6 to 21%
+    of units are at least 90% one sign, and 22 to 40% sit between 0.4 and 0.6,
+    where no orientation exists at all.
+
+    Parameters
+    ----------
+    model : InformedVAE
+        Must have been built with ``informed_decoder=True``; a dense decoder has
+        no units to orient.
+    min_genes : int, default 10
+        Units with fewer live weights than this are excluded from the per-unit
+        statistics, where a fraction over three or four genes is noise.
+
+    Returns
+    -------
+    dict
+        ``dec_out_frac_negative`` and ``encoder_frac_negative`` over live weights
+        (the latter is the control, and is 0.0 under ``nonneg_encoder``);
+        ``units_tested``; the median and quartiles of the per-unit positive
+        fraction; ``units_90pct_one_sign``; and ``units_no_orientation``, the
+        fraction between 0.4 and 0.6.
+
+    Examples
+    --------
+    >>> s = unit_sign_structure(model)
+    >>> s["dec_out_frac_negative"], s["frac_pos_median"]
+    (0.5019, 0.5)
+    """
+    import numpy as np
+
+    dec_out = getattr(model.decoder, "dec_out", None)
+    if dec_out is None or not hasattr(dec_out, "effective_weight"):
+        raise ValueError(
+            "unit_sign_structure needs a masked decoder: build the model with "
+            "informed_decoder=True. A dense dec_out has no per-unit gene set, so "
+            "there is no unit whose sign could be measured."
+        )
+
+    w = dec_out.effective_weight().detach().cpu().numpy()
+    live = dec_out.mask.detach().cpu().numpy() > 0
+    frac_pos = np.array([
+        (w[live[:, j], j] > 0).mean() if live[:, j].any() else np.nan
+        for j in range(w.shape[1])
+    ])
+    tested = live.sum(axis=0) >= min_genes
+
+    enc = model.encoder.informed
+    w_enc = enc.effective_weight().detach().cpu().numpy()
+    live_enc = enc.mask.detach().cpu().numpy() > 0
+
+    if not tested.any():
+        raise ValueError(
+            f"no unit has {min_genes} or more live weights; lower min_genes"
+        )
+
+    f = frac_pos[tested]
+    return {
+        "dec_out_frac_negative": float((w[live] < 0).mean()),
+        "encoder_frac_negative": float((w_enc[live_enc] < 0).mean()),
+        "units_tested": int(tested.sum()),
+        "frac_pos_median": float(np.nanmedian(f)),
+        "frac_pos_q25": float(np.nanquantile(f, 0.25)),
+        "frac_pos_q75": float(np.nanquantile(f, 0.75)),
+        "units_90pct_one_sign": float(np.mean((f >= 0.9) | (f <= 0.1))),
+        "units_no_orientation": float(np.mean((f >= 0.4) & (f <= 0.6))),
+    }
+
+
+def unit_contrast(
+    model,
+    x,
+    cov_a,
+    cov_b,
+    *,
+    pathway_names=None,
+    gene_names=None,
+    device=None,
+    batch_size: int = 2048,
+):
+    """The `a -> b` covariate contrast, read in the decoder's pathway basis.
+
+    Use this when ``InformedVAE.pathway_contrast`` is unavailable -- that is,
+    whenever the covariate does not reach the pathway layer as a single term,
+    which includes every model built with the default ``cov_mode="gene"``. It
+    measures what actually arrives, from the forward pass, rather than reading a
+    weight matrix and assuming.
+
+    Both covariate settings are **re-encoded**. Holding ``mu`` fixed, as
+    ``predict_counterfactual`` does, makes the pathway layer identical on both
+    sides so it cancels exactly, which is why that route carries none of the
+    contrast. Re-encoding restores ``cov -> fc_mean -> z -> dec_latent -> h'``,
+    and because ``dec_out`` is masked, unit *j*'s share of the shift lands only
+    on pathway *j*'s member genes.
+
+    Since ``logits = dec_out(h') + cov_decoder(cov)`` under ``cov_mode="gene"``,
+    the gene-level shift splits exactly in two, and the split is the measurement
+    that matters: ``masked_share`` says what fraction of the conditional effect
+    is expressed in the annotation basis at all. Measured on the shipped
+    architecture it is 0.04 to 0.11, near-orthogonal to the dense part, and does
+    not carry the biology.
+
+    Units are ranked by ``member_mean_shift``, never by ``delta_post``, because
+    ``dec_out`` carries no sign constraint unless ``nonneg_decoder=True`` and a
+    unit's own sign therefore does not fix its genes' direction. See
+    :func:`unit_sign_structure`.
+
+    Parameters
+    ----------
+    model : InformedVAE
+        Built with ``informed_decoder=True`` and ``n_cov > 0``.
+    x : (n_cells, n_genes) array, DataFrame or tensor
+        The cells the contrast is evaluated on. Kept on the caller's device and
+        moved in batches.
+    cov_a, cov_b : (n_cells, n_cov)
+        The two covariate settings for those same cells, differing only in the
+        block being contrasted.
+    pathway_names, gene_names : sequence, optional
+        Index labels for the two returned frames.
+    device : str, optional
+        Defaults to the model's current device.
+    batch_size : int, default 2048
+        Memory only; does not change the result.
+
+    Returns
+    -------
+    dict
+        ``units``: one row per pathway unit, with ``delta_pre`` (the
+        pre-activation shift, cell-independent for a clean two-level contrast),
+        ``delta_pre_sd`` (which must be ~0, and is the check that it was one),
+        ``delta_post``, ``member_mean_shift``, ``member_shift_z`` (the same
+        corrected for the ``1/sqrt(n)`` tilt that otherwise hands the top to the
+        smallest units), ``written_l2`` and ``saturated_frac``.
+        ``genes``: the gene-level shift split into ``masked``, ``bypass`` and
+        ``total``.
+        ``summary``: norms, cosines and Spearman correlations between the parts,
+        ``masked_share``, and the two diagnostics above.
+
+    Examples
+    --------
+    >>> res = unit_contrast(model, x, cov_a, cov_b, pathway_names=names,
+    ...                     gene_names=genes)
+    >>> res["summary"]["masked_share"]
+    0.07
+    >>> res["units"].sort_values("member_shift_z", ascending=False).head()
+    """
+    import numpy as np
+    import pandas as pd
+    import torch
+    from scipy import stats
+
+    dec = model.decoder
+    if not hasattr(dec, "dec_out") or not hasattr(dec.dec_out, "effective_weight"):
+        raise ValueError(
+            "unit_contrast needs a masked decoder: build the model with "
+            "informed_decoder=True"
+        )
+    if model.n_cov == 0:
+        raise ValueError("unit_contrast needs n_cov > 0: there is no covariate "
+                         "to contrast")
+
+    device = device or next(model.parameters()).device
+    model = model.to(device).eval()
+
+    def _arr(v):
+        # Not `hasattr(v, "values")`: torch.Tensor has a `.values` *method* for
+        # sparse tensors, so that duck-type check silently returns a bound
+        # method for any tensor input. `to_numpy` is pandas-only.
+        if isinstance(v, torch.Tensor):
+            return v.detach().cpu().numpy()
+        if hasattr(v, "to_numpy"):
+            return v.to_numpy()
+        return np.asarray(v)
+
+    xv, av, bv = _arr(x), _arr(cov_a), _arr(cov_b)
+    n_cells = len(xv)
+    n_units = dec.dec_latent.out_features
+    n_genes = dec.dec_out.effective_weight().shape[0]
+    pathway_names = (list(pathway_names) if pathway_names is not None
+                     else [f"pathway_{j}" for j in range(n_units)])
+    gene_names = (list(gene_names) if gene_names is not None
+                  else [f"gene_{i}" for i in range(n_genes)])
+
+    # cov_path, when present, is a second additive route into the pathway layer
+    # and belongs in the pre-activation alongside dec_latent.
+    has_cov_path = hasattr(dec, "cov_path")
+
+    def pre_of(z, c):
+        pre = dec.dec_latent(z)
+        return pre + dec.cov_path(c) if has_cov_path else pre
+
+    w_out = dec.dec_out.effective_weight().detach().double()
+    members = dec.dec_out.mask.detach().double()
+
+    acc = {k: torch.zeros(n_units, dtype=torch.float64, device=device)
+           for k in ("pre", "pre_sq", "post", "sat")}
+    masked_sum = torch.zeros(n_genes, dtype=torch.float64, device=device)
+
+    with torch.no_grad():
+        for s in range(0, n_cells, batch_size):
+            xb = torch.as_tensor(xv[s:s + batch_size], dtype=torch.float32,
+                                 device=device)
+            ab = torch.as_tensor(av[s:s + batch_size], dtype=torch.float32,
+                                 device=device)
+            bb = torch.as_tensor(bv[s:s + batch_size], dtype=torch.float32,
+                                 device=device)
+            # float64 BEFORE the tanh, not after. `tanh(pre + d) - tanh(pre)`
+            # for a small `d` is a catastrophic cancellation, and in float32 it
+            # underflows to exactly 0 for any unit with |pre| past about 4. That
+            # is not a rounding detail: a saturated unit then reports no
+            # direction rather than a small one, and a caller checking that each
+            # unit's sign matches its genes' sees spurious mismatches -- 9 of
+            # 1,615 on a Kang fit, which is the whole gap between a measured
+            # 0.9944 and the 1.0000 the architecture guarantees.
+            pre_a = pre_of(model.encode(xb, ab)[0], ab).double()
+            pre_b = pre_of(model.encode(xb, bb)[0], bb).double()
+            h_a, h_b = torch.tanh(pre_a), torch.tanh(pre_b)
+            d_pre = pre_b - pre_a
+            acc["pre"] += d_pre.sum(0)
+            acc["pre_sq"] += (d_pre ** 2).sum(0)
+            acc["post"] += (h_b - h_a).sum(0)
+            acc["sat"] += (h_a.abs() > 0.99).double().sum(0)
+            # `dec_out` is a float32 module, so the two sides are cast back for
+            # it and the difference is taken in float64 again. The gene-level
+            # split does not suffer the same cancellation -- `w_out` spreads one
+            # unit's shift over its members rather than differencing a
+            # saturating function -- but keeping one dtype rule is cheaper to
+            # reason about than two.
+            masked_sum += (dec.dec_out(h_b.float()).double()
+                           - dec.dec_out(h_a.float()).double()).sum(0)
+
+    delta_pre = (acc["pre"] / n_cells).cpu().numpy()
+    delta_pre_sd = np.sqrt(np.maximum(
+        (acc["pre_sq"] / n_cells).cpu().numpy() - delta_pre ** 2, 0.0))
+    delta_post = (acc["post"] / n_cells).cpu().numpy()
+    g_masked = (masked_sum / n_cells).cpu().numpy()
+
+    if hasattr(dec, "cov_decoder"):
+        with torch.no_grad():
+            d_cov = torch.as_tensor(bv - av, dtype=torch.float32,
+                                    device=device).mean(0, keepdim=True)
+            g_bypass = dec.cov_decoder(d_cov).double().cpu().numpy().ravel()
+    else:
+        g_bypass = np.zeros(n_genes)
+
+    n_members = members.sum(0).cpu().numpy()
+    w_sum = (w_out * members).sum(0).cpu().numpy()
+    w_l2 = w_out.pow(2).sum(0).sqrt().cpu().numpy()
+    safe = n_members > 0
+
+    units = pd.DataFrame({
+        "n_genes": n_members.astype(int),
+        "delta_pre": delta_pre,
+        "delta_pre_sd": delta_pre_sd,
+        "delta_post": delta_post,
+        "member_mean_shift": np.divide(delta_post * w_sum, n_members,
+                                       out=np.zeros_like(delta_post), where=safe),
+        "member_shift_z": np.divide(delta_post * w_sum, np.sqrt(np.maximum(n_members, 1)),
+                                    out=np.zeros_like(delta_post), where=safe),
+        "written_l2": np.abs(delta_post) * w_l2,
+        "saturated_frac": (acc["sat"] / n_cells).cpu().numpy(),
+    }, index=pathway_names)
+
+    g_total = g_masked + g_bypass
+    genes = pd.DataFrame({"masked": g_masked, "bypass": g_bypass,
+                          "total": g_total}, index=gene_names)
+
+    def _n(v):
+        return float(np.linalg.norm(v))
+
+    def _cos(u, v):
+        d = _n(u) * _n(v)
+        return float(np.dot(u, v) / d) if d > 0 else float("nan")
+
+    def _rho(u, v):
+        if np.ptp(u) == 0 or np.ptp(v) == 0:
+            return float("nan")
+        return float(stats.spearmanr(u, v).statistic)
+
+    denom = _n(g_masked) + _n(g_bypass)
+    summary = {
+        "cells": int(n_cells),
+        "masked_l2": _n(g_masked),
+        "bypass_l2": _n(g_bypass),
+        "total_l2": _n(g_total),
+        "masked_share": (_n(g_masked) / denom) if denom > 0 else float("nan"),
+        "cos_masked_total": _cos(g_masked, g_total),
+        "cos_masked_bypass": _cos(g_masked, g_bypass),
+        "rho_masked_total": _rho(g_masked, g_total),
+        # delta_pre is a linear image of a constant covariate difference, so it
+        # must not vary between cells. A non-zero maximum means the inputs were
+        # not a clean two-level contrast, and nothing below should be read.
+        "delta_pre_sd_max": float(delta_pre_sd.max()),
+        "saturated_frac_max": float(units["saturated_frac"].max()),
+    }
+    return {"units": units, "genes": genes, "summary": summary}
