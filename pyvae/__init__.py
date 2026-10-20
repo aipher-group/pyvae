@@ -1,3 +1,6 @@
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _dist_version
+
 from pyvae.bio import (
     InformedModelConfig,
     build_model_config,
@@ -42,3 +45,12 @@ __all__ = [
     "unit_contrast",
     "unit_sign_structure",
 ]
+
+
+# Read from the installed distribution, so `pyproject.toml` stays the single
+# place the number is written (`pixi run bump-version`). A source tree that was
+# never installed has no distribution to read.
+try:
+    __version__ = _dist_version("pyvae")
+except PackageNotFoundError:
+    __version__ = "0+unknown"

@@ -10,6 +10,8 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
+import pyvae
+
 PYPROJECT = Path(__file__).resolve().parents[2] / "pyproject.toml"
 
 
@@ -21,3 +23,10 @@ def test_the_three_version_declarations_agree():
         "[tool.pixi.package]": meta["tool"]["pixi"]["package"]["version"],
     }
     assert len(set(versions.values())) == 1, versions
+
+
+def test_dunder_version_is_the_pyproject_version():
+    # Fails after a bump until the environment reinstalls the package, which
+    # `pixi run` does on its own because pyvae is an editable path dependency.
+    meta = tomllib.loads(PYPROJECT.read_text())
+    assert pyvae.__version__ == meta["project"]["version"]
