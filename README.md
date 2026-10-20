@@ -37,13 +37,12 @@ Masking the encoder does not on its own make a latent dimension a pathway, since
 decoder. Measured against a shuffled annotation of identical set sizes and
 overlap, the encoder mask alone is worth +3.24 nats of held-out loss and masking
 the decoder as well raises that to +14.52. Both masks are flags, and
-[`experiments/DRAFT.md`](experiments/DRAFT.md) reports each.
+[`experiments`](experiments/) reports each.
 
 
 ## Validation
 
-Two Snakemake pipelines under [`experiments/`](experiments/) produce the paper
-draft, [`experiments/DRAFT.md`](experiments/DRAFT.md).
+Two Snakemake pipelines under [`experiments/`](experiments/) produce the thesis and future paper results draft, [`experiments`](experiments).
 
 [`experiments/kang/`](experiments/kang/) is the known-answer check. Kang 2018
 PBMCs under interferon-beta fix the right pathway before anything runs. Three
@@ -125,7 +124,7 @@ encoder mask a gene outside the set gets exactly zero.
 decodes it under another, using the posterior mean so the prediction is
 deterministic. Read it with care under `cov_mode="gene"`: the masked term then
 cancels between the two sides and what is left is one column difference of an
-unannotated matrix, which is the defect `experiments/DRAFT.md` is about.
+unannotated matrix, which is the defect `experiments/` is about.
 
 The gene-level read-outs remain, as baselines and for model-free comparison.
 `differential_expression` samples posterior per-gene differential expression
@@ -322,7 +321,6 @@ pyvae/
 tests/             contract + unit tests
 conda-recipe/      conda-forge recipe + submission guide
 experiments/
-├── DRAFT.md       the paper: methods, results, discussion
 ├── kang/          known-answer validation (Kang 2018 IFN-beta PBMCs)
 └── multiple_mieloma/   application to the myeloma precursor sequence
 ```
