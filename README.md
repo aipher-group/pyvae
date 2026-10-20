@@ -274,8 +274,9 @@ pip install -e ".[dev]" && pytest tests/ -v
 ## Releasing
 
 This repo publishes to both PyPI and conda-forge. Before releasing, bump the
-version in `pyproject.toml` (both `[project].version` and
-`[tool.pixi.package].version`).
+version with `pixi run bump-version patch` (or `minor`, `major`, or an explicit
+`X.Y.Z`). It sets the three declarations in `pyproject.toml` together, and
+`tests/unit/test_version_consistency.py` fails if they ever disagree.
 
 **PyPI** (Trusted Publishing in CI on a `v*` tag, or locally via the isolated
 `publish` env):

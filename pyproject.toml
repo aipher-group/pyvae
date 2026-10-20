@@ -87,6 +87,7 @@ pip = "*"
 isgpu = "python -c 'import torch; print(\"CUDA available:\", torch.cuda.is_available())'"
 fixcode = "ruff check --extend-select I --fix pyvae"
 formatcode = "ruff format pyvae"
+bump-version = { cmd = "python scripts/bump_version.py {{ part }}", args = ["part"], description = "Set the version in all three pyproject tables: major, minor, patch or X.Y.Z" }
 
 [tool.pixi.dependencies]
 # Python + conda-only / binary-critical packages
