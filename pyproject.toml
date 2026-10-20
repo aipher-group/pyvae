@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyvae"
-version = "1.0.0"
+version = "1.1.0"
 description = "Informed Variational Autoencoder (iVAE) with biologically constrained encoder layers."
 readme = "README.md"
 license = "MIT"
@@ -51,7 +51,7 @@ exclude = ["tests*"]
 
 [tool.pixi.workspace]
 name = "pyvae"
-version = "1.0.0"
+version = "1.1.0"
 authors = ["Amir Aynede <amiraynede@gmail.com>", "Carlos Loucera <clou@us.es>"]
 channels = ["conda-forge", "pytorch", "nvidia"]
 platforms = ["osx-arm64", "linux-64", "win-64"]
@@ -66,7 +66,7 @@ preview = ["pixi-build"]
 # single `noarch: python` conda package that installs on every platform.
 [tool.pixi.package]
 name = "pyvae"
-version = "1.0.0"
+version = "1.1.0"
 
 [tool.pixi.package.build.backend]
 name = "pixi-build-python"
@@ -87,6 +87,7 @@ pip = "*"
 isgpu = "python -c 'import torch; print(\"CUDA available:\", torch.cuda.is_available())'"
 fixcode = "ruff check --extend-select I --fix pyvae"
 formatcode = "ruff format pyvae"
+bump-version = { cmd = "python scripts/bump_version.py {{ part }}", args = ["part"], description = "Set the version in all three pyproject tables: major, minor, patch or X.Y.Z" }
 
 [tool.pixi.dependencies]
 # Python + conda-only / binary-critical packages

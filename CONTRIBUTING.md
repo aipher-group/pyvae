@@ -29,7 +29,7 @@ and that tag's commit is on `main`. A bare `git push origin vX.Y.Z` does **not**
 publish.
 
 ```bash
-# 1. bump the version in pyproject.toml ([project] + [tool.pixi.*]) on develop, then:
+# 1. pixi run bump-version patch   (or minor | major | X.Y.Z) on develop, then:
 gh pr create --base main --head develop --title "Release vX.Y.Z"
 
 # 2. after the PR merges, cut the release FROM main (creates the tag + triggers release.yml):

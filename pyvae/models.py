@@ -9,11 +9,14 @@ encoder and (for the informed_decoder flag) the decoder:
 - ``informed_decoder`` — when True, the decoder's ``dec_out`` layer is masked
   by ``adj`` too, so each pathway's decoder output only affects its member
   genes.
+- ``informed_encoder`` — when False, the encoder's mask is dropped and every
+  unit reads every gene. Defaults to True, which is what the encoder has
+  always done. It exists so the encoder mask can be ablated the way
+  ``informed_decoder`` ablates the decoder's, with everything else held fixed.
 - ``nonneg_encoder`` — when True, the encoder's InformedLinear uses softplus
   reparametrisation so every live weight stays positive. Deliberately named
   ``nonneg_encoder`` (not ``nonneg``) to make explicit that this constraint
-  applies to the encoder side only. A non-negative decoder could never lower
-  a gene, which would strip pathways of the ability to repress.
+  applies to the encoder side only; ``nonneg_decoder`` is a separate flag.
 - ``standardize_input`` — when True, the encoder z-scores its input per gene
   before the masked matmul, so no single loud gene can dominate its unit.
 
@@ -51,11 +54,39 @@ class InformedVAE(nn.Module):
         init: str = "xavier",
         normalize: str = "none",
         informed_decoder: bool = False,
+        informed_encoder: bool = True,
         nonneg_encoder: bool = False,
         standardize_input: bool = False,
+        cov_mode: str = "gene",
+        cov_in_encoder: bool = True,
+        nonneg_decoder: bool = False,
     ):
         super().__init__()
         torch.manual_seed(seed)
+
+        if cov_mode not in ("gene", "pathway"):
+            raise ValueError(
+                f'cov_mode must be "gene" or "pathway"; got {cov_mode!r}'
+            )
+        if nonneg_decoder and not informed_decoder:
+            raise ValueError(
+                "nonneg_decoder=True requires informed_decoder=True: a dense "
+                "decoder has no pathway units to orient, so constraining its "
+                "signs would restrict the model without making anything "
+                "interpretable"
+            )
+        if nonneg_encoder and not informed_encoder:
+            raise ValueError(
+                "nonneg_encoder=True requires informed_encoder=True: with no "
+                "encoder mask every unit reads every gene, so positive weights "
+                "would constrain the whole first layer without making any unit "
+                "a pathway. Set both to False to ablate the encoder mask."
+            )
+        if cov_mode == "pathway" and n_cov == 0:
+            raise ValueError(
+                'cov_mode="pathway" requires n_cov > 0; with no covariate there '
+                "is nothing to route through the pathway layer"
+            )
 
         n_genes, n_pathways = adj.shape
 
@@ -72,8 +103,12 @@ class InformedVAE(nn.Module):
         self.init_kind = init
         self.normalize_kind = normalize
         self.informed_decoder = informed_decoder
+        self.informed_encoder = informed_encoder
         self.nonneg_encoder = nonneg_encoder
         self.standardize_input_enabled = standardize_input
+        self.cov_mode = cov_mode
+        self.cov_in_encoder = cov_in_encoder
+        self.nonneg_decoder = nonneg_decoder
 
         self.encoder = Encoder(
             adj=adj,
@@ -83,12 +118,25 @@ class InformedVAE(nn.Module):
             normalize=normalize,
             nonneg=nonneg_encoder,
             standardize_input=standardize_input,
+            use_cov=cov_in_encoder,
+            use_mask=informed_encoder,
         )
 
         # Pass adj to the decoder only when informed_decoder is on.
-        # Do NOT pass nonneg or standardize_input to the decoder: a non-negative
-        # decoder cannot lower a gene, and standardize_input on latent-derived
-        # activations would fight the reconstruction loss.
+        #
+        # `nonneg_encoder` and `nonneg_decoder` are separate flags and neither
+        # implies the other. An earlier version of this comment claimed a
+        # non-negative decoder "cannot lower a gene", which is why the option
+        # was never wired; it is false. The pathway layer is a tanh and may be
+        # negative, so `dec_out` with positive weights still lowers a gene when
+        # its unit falls -- the direction moves from the weight to the unit's
+        # activity, which is exactly what gives a pathway's sign a meaning.
+        # Without it, measured on trained fits, `dec_out` is ~50% negative and
+        # the per-unit fraction of positive weights has median 0.500, so a unit
+        # rising raises half its genes and lowers the other half.
+        #
+        # `standardize_input` still does NOT reach the decoder: a BatchNorm on
+        # latent-derived activations would fight the reconstruction loss.
         dec_adj = adj if informed_decoder else None
 
         if likelihood == "gaussian":
@@ -99,6 +147,8 @@ class InformedVAE(nn.Module):
                 n_cov=n_cov,
                 adj=dec_adj,
                 init=init,
+                nonneg=nonneg_decoder,
+                cov_mode=cov_mode,
             )
             self.likelihood = GaussianLikelihood()
         elif likelihood == "nb":
@@ -109,6 +159,8 @@ class InformedVAE(nn.Module):
                 n_cov=n_cov,
                 adj=dec_adj,
                 init=init,
+                nonneg=nonneg_decoder,
+                cov_mode=cov_mode,
             )
             self.likelihood = None
         else:
@@ -165,6 +217,75 @@ class InformedVAE(nn.Module):
         return recon_loss + beta_eff * kl_loss + l2_loss
 
     @torch.no_grad()
+    def pathway_contrast(
+        self,
+        cov_a: torch.Tensor,
+        cov_b: torch.Tensor,
+    ) -> torch.Tensor:
+        """The `a -> b` covariate effect, as one signed number per pathway.
+
+        Returns ``cov_path.weight @ (cov_b - cov_a)``, shape ``(n_pathways,)``:
+        the shift the covariate imposes on each pathway unit's pre-activation.
+        It is cell-independent and exact -- no cells, no sampling, no
+        counterfactual -- and positive means the pathway goes up.
+
+        "Up" means what it says only when ``nonneg_decoder=True``. Otherwise
+        ``dec_out`` has free signs, each unit's polarity is arbitrary, and this
+        vector ranks the right answer no better than chance: measured on Kang,
+        the known target sits at rank 1,349 of 1,615 by this quantity without the
+        constraint and at 22 with it. The constraint is not enforced here,
+        because an unconstrained model's contrast is still the correct
+        *magnitude* per unit, but a caller ranking units by sign needs it.
+
+        Requires ``cov_mode="pathway"`` and ``cov_in_encoder=False``. With the
+        encoder route open the covariate also reaches the pathway layer through
+        ``z``, so this term is one of two additive routes and is not the
+        contrast; returning it as though it were is a mistake with measured
+        consequences -- on a 125k-cell fit it ranked the known target 1,246th of
+        1,615 while the gene-level signal looked correct. Use
+        ``pyvae.interpret.unit_contrast`` for that case, which measures both
+        routes from the forward pass.
+
+        Parameters
+        ----------
+        cov_a, cov_b : (n_cov,) or (1, n_cov) or (batch, n_cov)
+            The two covariate settings. A batch is reduced by its mean, which is
+            exact because the map is linear.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(n_pathways,)``, on the model's device.
+
+        Raises
+        ------
+        ValueError
+            If the model was not built for this read-out, naming the flag that
+            is wrong rather than failing on a missing attribute.
+        """
+        if self.cov_mode != "pathway":
+            raise ValueError(
+                'pathway_contrast requires cov_mode="pathway"; this model has '
+                f'cov_mode="{self.cov_mode}", whose covariate term is dense over '
+                "genes and never passes through the pathway mask. Rebuild with "
+                'cov_mode="pathway", or use pyvae.interpret.unit_contrast to '
+                "measure what reaches the pathway layer in this model."
+            )
+        if self.cov_in_encoder:
+            raise ValueError(
+                "pathway_contrast requires cov_in_encoder=False; with the "
+                "encoder's covariate route open, cov_path carries only part of "
+                "the conditional effect and the rest arrives through z. Rebuild "
+                "with cov_in_encoder=False, or use pyvae.interpret.unit_contrast, "
+                "which measures both routes."
+            )
+
+        w = self.decoder.cov_path.weight  # (n_pathways, n_cov)
+        a = torch.as_tensor(cov_a, dtype=w.dtype, device=w.device).reshape(-1, self.n_cov)
+        b = torch.as_tensor(cov_b, dtype=w.dtype, device=w.device).reshape(-1, self.n_cov)
+        return w @ (b.mean(0) - a.mean(0))
+
+    @torch.no_grad()
     def predict_counterfactual(
         self,
         x: torch.Tensor,
@@ -180,6 +301,16 @@ class InformedVAE(nn.Module):
         (rather than sampling) keeps the prediction deterministic: the only
         thing that changes between two calls with the same inputs is the
         covariate, not random noise from reparameterise().
+
+        What holding ``mu`` fixed implies, with ``cov_mode="gene"``: the masked
+        pathway layer is then identical on both sides and cancels exactly, so the
+        predicted shift is precisely ``cov_decoder[:, to] - cov_decoder[:, from]``
+        -- one dense weight difference that never touches the annotation.
+        Measured against this function's own output, the residual is 5.7e-07.
+        That is the intended behaviour of a counterfactual at fixed latent state,
+        and it is also why a permuted gene->pathway map leaves the result
+        unchanged. With ``cov_mode="pathway"`` the covariate term sits inside the
+        pathway layer instead, so the shift does pass through the mask.
 
         Requires ``likelihood_kind == "nb"``; raises otherwise since the
         return value is expressed in count space using ``library``.

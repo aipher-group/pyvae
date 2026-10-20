@@ -85,6 +85,14 @@ class InformedLinear(nn.Module):
         the masked matmul. This removes scale freedom on the input side:
         one loud gene can no longer swamp its pathway's unit simply by
         virtue of having a large variance.
+    use_mask : bool, default True
+        When False the mask is all ones, so every unit reads every gene and
+        the layer is an ordinary dense linear with this layer's init,
+        normalisation and sign options still applied. ``adj`` is then used
+        only for its shape. This exists to ablate the annotation while
+        holding everything else fixed: a dense layer built separately would
+        differ in initialisation and normalisation as well, and the
+        comparison would not isolate the mask.
 
     Attributes
     ----------
@@ -124,6 +132,7 @@ class InformedLinear(nn.Module):
         mask_bias: bool = True,
         nonneg: bool = False,
         standardize_input: bool = False,
+        use_mask: bool = True,
     ):
         super().__init__()
 
@@ -147,11 +156,20 @@ class InformedLinear(nn.Module):
         self.mask_bias_enabled = mask_bias
         self.nonneg = nonneg
         self.standardize_input_enabled = standardize_input
+        self.use_mask = use_mask
 
         self.weight = nn.Parameter(torch.empty(out_f, in_f))
         self.bias = nn.Parameter(torch.zeros(out_f))
-        self.register_buffer("mask", adj.T.float())
-        self.register_buffer("bias_mask", (adj.sum(dim=0) > 0).float())
+        # An all-ones mask rather than a separate dense code path, so that
+        # `effective_weight`, the fan-in initialiser and every read-out that
+        # counts live weights keep working and simply see every weight as
+        # live. The buffer is the same size either way.
+        if use_mask:
+            self.register_buffer("mask", adj.T.float())
+            self.register_buffer("bias_mask", (adj.sum(dim=0) > 0).float())
+        else:
+            self.register_buffer("mask", torch.ones(out_f, in_f))
+            self.register_buffer("bias_mask", torch.ones(out_f))
 
         # Initialise weights. If nonneg is on, the parameter we store is a
         # pre-softplus value; we set it so softplus reproduces the intended

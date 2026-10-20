@@ -344,11 +344,19 @@ def train_ivae_modern(
     #
     # Do not put the data back in the TensorDataset: per-sample indexing and
     # collation would trade one gather per batch for a few hundred small ones.
+    # A trailing batch of exactly one row makes BatchNorm raise ("Expected more
+    # than 1 value per channel when training"), so the one case that cannot run
+    # is dropped. The condition is deliberately narrow: whenever the remainder is
+    # not 1, `drop_last` stays False and the batching -- and therefore every
+    # previously trained model -- is bit-for-bit unchanged. `drop_last` affects
+    # only the BatchSampler, never the RandomSampler that consumes `generator`,
+    # so the shuffle order is identical either way.
     train_loader = DataLoader(
         TensorDataset(torch.arange(x_train_tensor.shape[0])),
         batch_size=batch_size,
         shuffle=True,
         generator=generator,
+        drop_last=x_train_tensor.shape[0] % batch_size == 1,
     )
     val_loader = DataLoader(
         TensorDataset(torch.arange(x_val_tensor.shape[0])),
