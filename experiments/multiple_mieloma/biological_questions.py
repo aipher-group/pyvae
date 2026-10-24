@@ -1,10 +1,17 @@
 """
-biological_questions.py — exploratory figures answering Carlos's suggestion:
+biological_questions.py
 "explore MM stages beyond cross-cohort agreement."
 
 v3: adds `low_signal` class and tightens `peak_dominance` so noise pathways
     don't flood the real timing categories. See classify_timing() docstring.
 v4: adds fig6 — donor-level heterogeneity (PCA + MM-shift score).
+v5: adds fig7 — driver-gene attribution for defended units, from
+    table2_drivers.csv. First-pass only; richer top-k version requires
+    re-running the biology notebook with model-weight access.
+v6: fig7 Panel B rebuilt as 8-dot scatter (defended units only — table2
+    carries 4 per cohort), with per-dot labels and sides-agree highlight.
+v7: fig7 Panel B replaced with horizontal grouped bar chart (encoder dark /
+    decoder light bars per unit), eliminating label overlap.
 
 Run from the repo root:
 
@@ -657,6 +664,342 @@ def fig6_donor_heterogeneity(
     }
 
 
+# ===========================================================================
+# fig7 — driver-gene attribution for defended units (Q#3)
+# ===========================================================================
+
+BIOLOGY_TABLE2_PATHS = {
+    "Zavidij_2020": REPO_ROOT / "experiments" / "multiple_mieloma" / "outputs"
+                    / "biology" / "Zavidij_2020" / "table2_drivers.csv",
+    "Foster_2026":  REPO_ROOT / "experiments" / "multiple_mieloma" / "outputs"
+                    / "biology" / "Foster_2026" / "table2_drivers.csv",
+}
+
+
+# Short display names for defended-tier units
+UNIT_SHORT_NAMES = {
+    "REACTOME_INTERFERON_ALPHA_BETA_SIGNALING": "IFN α/β",
+    "REACTOME_MITOCHONDRIAL_TRANSLATION": "Mito. translation",
+    "REACTOME_OAS_ANTIVIRAL_RESPONSE": "OAS antiviral",
+    "REACTOME_CROSS_PRESENTATION_OF_SOLUBLE_EXOGENOUS_ANTIGENS_ENDOSOMES":
+        "Cross-presentation",
+    "REACTOME_CELL_SURFACE_INTERACTIONS_AT_THE_VASCULAR_WALL":
+        "Vascular wall",
+    "REACTOME_SLC_MEDIATED_TRANSMEMBRANE_TRANSPORT": "SLC transport",
+    "REACTOME_FCERI_MEDIATED_MAPK_ACTIVATION": "FCERI MAPK",
+}
+
+
+def _short_unit(unit: str) -> str:
+    """Return a short display name for a Reactome unit; fall back to a trim."""
+    if unit in UNIT_SHORT_NAMES:
+        return UNIT_SHORT_NAMES[unit]
+    return unit.replace("REACTOME_", "").replace("_", " ").title()[:28]
+
+
+def fig7_driver_attribution(
+    out_dir: Path = OUT_DIR,
+    highlight_unit: str = "REACTOME_INTERFERON_ALPHA_BETA_SIGNALING",
+) -> dict:
+    """fig7 — gene-level attribution for defended Reactome units.
+
+    Uses table2_drivers.csv (top-1 driver per encoder/decoder side per unit).
+
+    Panel A: Bar chart of highlight_unit's four top-driver observations
+             (Zavidij-encoder, Zavidij-decoder, Foster-encoder, Foster-decoder).
+             IFITM1 highlighted whenever it appears, since it's the cross-cohort
+             driver.
+    Panel B: Attribution concentration landscape — scatter of all units'
+             encoder_top_share vs decoder_top_share, per cohort. The highlight
+             unit is circled per cohort.
+
+    Writes a cross-cohort driver concordance CSV alongside.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    tables = {name: pd.read_csv(p) for name, p in BIOLOGY_TABLE2_PATHS.items()}
+
+    ifn_rows: dict = {}
+    for cohort_name, df in tables.items():
+        row = df[df["unit"] == highlight_unit]
+        if len(row) > 0:
+            ifn_rows[cohort_name] = row.iloc[0].to_dict()
+
+    if not ifn_rows:
+        raise RuntimeError(f"{highlight_unit} not found in any cohort table")
+
+    cohort_order = ["Zavidij_2020", "Foster_2026"]
+    cohort_dot_color = {
+        "Zavidij_2020": "#4C72B0",  # blue
+        "Foster_2026":  "#DD8452",  # orange
+    }
+
+    fig, (ax_a, ax_b) = plt.subplots(
+        1, 2, figsize=(17, 8),
+        gridspec_kw={"width_ratios": [1.0, 1.5]},
+    )
+
+    # ---------- Panel A: bar chart of defended-unit drivers ----------
+    labels, shares, genes, bar_colors = [], [], [], []
+    for cohort_name in cohort_order:
+        if cohort_name not in ifn_rows:
+            continue
+        r = ifn_rows[cohort_name]
+        for side in ("encoder", "decoder"):
+            labels.append(f"{cohort_name.replace('_', ' ')}\n{side}")
+            shares.append(r[f"{side}_top_share"])
+            gene = r[f"{side}_top"]
+            genes.append(gene)
+            bar_colors.append("#D62728" if gene == "IFITM1" else "#808080")
+
+    x_pos = np.arange(len(labels))
+    bars = ax_a.bar(x_pos, shares, color=bar_colors,
+                    edgecolor="black", linewidth=1.0)
+
+    for bar, gene, share in zip(bars, genes, shares):
+        bx = bar.get_x() + bar.get_width() / 2
+        by = bar.get_height()
+        ax_a.text(bx, by + 0.015, gene, ha="center", fontsize=11,
+                  fontweight="bold",
+                  color="#D62728" if gene == "IFITM1" else "black")
+        ax_a.text(bx, by / 2, f"{share * 100:.1f}%", ha="center",
+                  fontsize=10, color="white", fontweight="bold")
+
+    even_share = next(iter(ifn_rows.values())).get("even_share")
+    if even_share is not None:
+        ax_a.axhline(even_share, color="gray", linewidth=0.8,
+                     linestyle="--", alpha=0.6,
+                     label=f"even-share baseline (1 / n_genes = {even_share:.3f})")
+
+    ax_a.set_xticks(x_pos)
+    ax_a.set_xticklabels(labels, fontsize=9)
+    ax_a.set_ylabel("Top-driver share of unit attribution")
+    unit_short = highlight_unit.replace("REACTOME_", "").replace("_", " ").title()
+    ax_a.set_title(
+        f"{unit_short}\nIFITM1 (red) is a top driver in both cohorts",
+        fontsize=11,
+    )
+    ax_a.legend(fontsize=9, loc="upper left", frameon=False)
+    ax_a.grid(True, axis="y", alpha=0.3)
+    ax_a.set_ylim(0, max(shares) * 1.18 if shares else 1.0)
+
+    # ---------- Panel B: horizontal grouped bar chart ----------
+    # Collect all 8 unit-cohort combinations, sorted within cohort by endpoint z
+    unit_rows: list[dict] = []
+    for cohort_name in cohort_order:
+        df = (
+            tables[cohort_name]
+            .sort_values("member_shift_z_endpoint", ascending=False)
+        )
+        for _, r in df.iterrows():
+            unit_rows.append({
+                "unit_short": _short_unit(r["unit"]),
+                "cohort": cohort_name,
+                "cohort_short": cohort_name.split("_")[0],
+                "encoder_share": float(r["encoder_top_share"]),
+                "encoder_top": r["encoder_top"],
+                "decoder_share": float(r["decoder_top_share"]),
+                "decoder_top": r["decoder_top"],
+                "is_ifn": r["unit"] == highlight_unit,
+                "sides_agree": bool(r["sides_agree"]),
+            })
+
+    n_rows = len(unit_rows)
+    bar_h = 0.38
+
+    for i, u in enumerate(unit_rows):
+        y_center = n_rows - 1 - i  # top-down natural reading
+        cc = cohort_dot_color[u["cohort"]]
+        edge_c = "red" if u["is_ifn"] else "none"
+        edge_lw = 1.8 if u["is_ifn"] else 0
+
+        # Encoder (dark) — above center
+        ax_b.barh(
+            y_center + bar_h / 2, u["encoder_share"], bar_h,
+            color=cc, alpha=0.95, edgecolor=edge_c, linewidth=edge_lw,
+            zorder=3,
+        )
+        # Decoder (light) — below center
+        ax_b.barh(
+            y_center - bar_h / 2, u["decoder_share"], bar_h,
+            color=cc, alpha=0.45, edgecolor=edge_c, linewidth=edge_lw,
+            zorder=3,
+        )
+
+        # Gene labels at bar tips (encoder, then decoder)
+        for yoff, side, gene, share in [
+            (bar_h / 2, "enc", u["encoder_top"], u["encoder_share"]),
+            (-bar_h / 2, "dec", u["decoder_top"], u["decoder_share"]),
+        ]:
+            is_ifitm1 = gene == "IFITM1"
+            is_sides_agree_gene = (
+                u["sides_agree"] and gene == u["encoder_top"]
+            )
+            text_color = (
+                "#D62728" if is_ifitm1
+                else ("#000000" if is_sides_agree_gene else "#333333")
+            )
+            fw = "bold" if (is_ifitm1 or is_sides_agree_gene) else "normal"
+            ax_b.text(
+                share + 0.012, y_center + yoff,
+                f"{side}: {gene}  ({share * 100:.1f}%)",
+                fontsize=8.5, va="center",
+                color=text_color, fontweight=fw,
+            )
+
+    # Y-axis labels — unit (cohort)
+    ax_b.set_yticks(list(range(n_rows - 1, -1, -1)))
+    ax_b.set_yticklabels(
+        [f"{u['unit_short']}  [{u['cohort_short']}]" for u in unit_rows],
+        fontsize=9,
+    )
+    ax_b.set_ylim(-0.6, n_rows - 0.4)
+
+    # Legend
+    from matplotlib.lines import Line2D as _L2D
+    from matplotlib.patches import Patch as _Patch
+    legend_handles = [
+        _Patch(facecolor=cohort_dot_color["Zavidij_2020"], alpha=0.95,
+               label="Zavidij 2020"),
+        _Patch(facecolor=cohort_dot_color["Foster_2026"], alpha=0.95,
+               label="Foster 2026"),
+        _Patch(facecolor="gray", alpha=0.95, label="encoder (top bar)"),
+        _Patch(facecolor="gray", alpha=0.45, label="decoder (bottom bar)"),
+        _L2D([0], [0], marker="s", color="w",
+             markerfacecolor="w", markeredgecolor="red", markeredgewidth=1.8,
+             markersize=11, label="IFN α/β (shared defended unit)"),
+    ]
+    ax_b.legend(
+        handles=legend_handles, fontsize=8, loc="upper right",
+        frameon=False, bbox_to_anchor=(1.0, 1.0),
+    )
+
+    ax_b.set_xlabel("Top-driver share of unit attribution")
+    ax_b.set_title(
+        "All 8 defended-tier driver observations\n"
+        "IFITM1 (red) is the only gene shared across cohorts; "
+        "PSMB9 is the only sides-agree unit",
+        fontsize=11,
+    )
+    ax_b.set_xlim(0, 1.18)
+    ax_b.grid(True, axis="x", alpha=0.3, zorder=1)
+    ax_b.axvline(1 / 59, color="gray", linewidth=0.6, linestyle="--",
+                 alpha=0.5, zorder=1)
+
+    fig.suptitle(
+        f"fig7 — Gene-level attribution of defended Reactome units",
+        fontsize=12, y=1.00,
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+
+    pdf_path = out_dir / "fig7_driver_attribution.pdf"
+    png_path = out_dir / "fig7_driver_attribution.png"
+    fig.savefig(pdf_path, bbox_inches="tight", dpi=200)
+    fig.savefig(png_path, bbox_inches="tight", dpi=200)
+    plt.close(fig)
+
+    # ---------- Cross-cohort driver concordance ----------
+    merged = tables["Zavidij_2020"].merge(
+        tables["Foster_2026"], on="unit", suffixes=("_zav", "_fos")
+    )
+    enc_concordant = merged["encoder_top_zav"] == merged["encoder_top_fos"]
+    dec_concordant = merged["decoder_top_zav"] == merged["decoder_top_fos"]
+    concordance = pd.DataFrame({
+        "unit": merged["unit"],
+        "encoder_top_zav": merged["encoder_top_zav"],
+        "encoder_top_fos": merged["encoder_top_fos"],
+        "encoder_concordant": enc_concordant,
+        "decoder_top_zav": merged["decoder_top_zav"],
+        "decoder_top_fos": merged["decoder_top_fos"],
+        "decoder_concordant": dec_concordant,
+        "any_side_shared_gene": (
+            (merged["encoder_top_zav"] == merged["encoder_top_fos"])
+            | (merged["encoder_top_zav"] == merged["decoder_top_fos"])
+            | (merged["decoder_top_zav"] == merged["encoder_top_fos"])
+            | (merged["decoder_top_zav"] == merged["decoder_top_fos"])
+        ),
+    })
+    concordance_csv = out_dir / "fig7_cross_cohort_driver_concordance.csv"
+    concordance.to_csv(concordance_csv, index=False)
+
+    # Defended-tier set analysis (which units are shared vs cohort-specific)
+    zav_units = set(tables["Zavidij_2020"]["unit"])
+    fos_units = set(tables["Foster_2026"]["unit"])
+    shared_units = zav_units & fos_units
+    zav_only = zav_units - fos_units
+    fos_only = fos_units - zav_units
+
+    # Any gene appearing more than once across all 8 driver observations
+    all_driver_genes = []
+    for cohort_name, df in tables.items():
+        for _, r in df.iterrows():
+            all_driver_genes.append(
+                (cohort_name, r["unit"], "encoder", r["encoder_top"])
+            )
+            all_driver_genes.append(
+                (cohort_name, r["unit"], "decoder", r["decoder_top"])
+            )
+    gene_df = pd.DataFrame(
+        all_driver_genes, columns=["cohort", "unit", "side", "gene"]
+    )
+    gene_freq = gene_df["gene"].value_counts()
+    repeat_genes = gene_freq[gene_freq > 1]
+
+    print("✓ fig7_driver_attribution — wrote:")
+    print(f"    {pdf_path}")
+    print(f"    {png_path}")
+    print(f"    {concordance_csv}")
+    print()
+    print(f"Highlighted unit: {highlight_unit}")
+    for cohort_name in cohort_order:
+        if cohort_name not in ifn_rows:
+            continue
+        r = ifn_rows[cohort_name]
+        print(f"  {cohort_name}:")
+        print(f"    encoder_top = {r['encoder_top']} "
+              f"({r['encoder_top_share'] * 100:.2f}%)")
+        print(f"    decoder_top = {r['decoder_top']} "
+              f"({r['decoder_top_share'] * 100:.2f}%)")
+        print(f"    sides_agree = {r['sides_agree']}, "
+              f"endpoint z = {r['member_shift_z_endpoint']:.2f}")
+    print()
+
+    print("Defended-tier set analysis:")
+    print(f"    Zavidij: {len(zav_units)} units     Foster: {len(fos_units)} units")
+    print(f"    Shared across cohorts: {len(shared_units)}")
+    for u in sorted(shared_units):
+        print(f"        - {u}")
+    print(f"    Zavidij-only: {len(zav_only)}")
+    for u in sorted(zav_only):
+        print(f"        - {u}")
+    print(f"    Foster-only:  {len(fos_only)}")
+    for u in sorted(fos_only):
+        print(f"        - {u}")
+    print()
+    print("Genes appearing as top-driver more than once across all 8 "
+          "defended driver observations:")
+    if len(repeat_genes) > 0:
+        for gene, n in repeat_genes.items():
+            rows = gene_df[gene_df["gene"] == gene]
+            print(f"    {gene} (×{n}):")
+            for _, g in rows.iterrows():
+                print(f"        {g['cohort']}  {_short_unit(g['unit']):<24} "
+                      f"{g['side']}")
+    else:
+        print("    (none — every defended driver observation is a different gene)")
+
+    return {
+        "ifn_rows": ifn_rows,
+        "concordance": concordance,
+        "shared_units": shared_units,
+        "zav_only": zav_only,
+        "fos_only": fos_only,
+        "repeat_genes": repeat_genes,
+        "tables": tables,
+    }
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -664,7 +1007,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Biological questions figures.")
     parser.add_argument(
         "--fig",
-        choices=["fig5", "fig6", "all"],
+        choices=["fig5", "fig6", "fig7", "all"],
         default="fig5",
         help="Which figure to generate (default: fig5).",
     )
@@ -703,6 +1046,8 @@ def main() -> None:
             estimator=args.estimator,
             n_components=args.n_components,
         )
+    if args.fig in ("fig7", "all"):
+        fig7_driver_attribution()
 
 
 if __name__ == "__main__":
