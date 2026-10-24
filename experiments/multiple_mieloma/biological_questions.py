@@ -3,8 +3,8 @@ biological_questions.py — exploratory figures answering Carlos's suggestion:
 "explore MM stages beyond cross-cohort agreement."
 
 v3: adds `low_signal` class and tightens `peak_dominance` so noise pathways
-    don't flood the real timing categories.
-    See classify_timing() docstring for the rule.
+    don't flood the real timing categories. See classify_timing() docstring.
+v4: adds fig6 — donor-level heterogeneity (PCA + MM-shift score).
 
 Run from the repo root:
 
@@ -376,6 +376,287 @@ def fig5_pathway_timing(
     }
 
 
+# ===========================================================================
+# fig6 — donor-level heterogeneity (Q#2)
+# ===========================================================================
+
+DONOR_SCORES_PATHS = {
+    "Zavidij_2020": REPO_ROOT / "experiments" / "multiple_mieloma" / "outputs"
+                    / "donor_test" / "Zavidij_2020" / "donor_scores.csv",
+    "Foster_2026":  REPO_ROOT / "experiments" / "multiple_mieloma" / "outputs"
+                    / "donor_test" / "Foster_2026" / "donor_scores.csv",
+}
+
+STAGE_ORDER_FULL = ["Non", "MGUS", "SMM", "MM"]
+STAGE_X_INT = {"Non": 0, "MGUS": 1, "SMM": 2, "MM": 3}
+STAGE_COLORS = {
+    "Non":  "#2CA02C",   # green
+    "MGUS": "#FF7F0E",   # orange
+    "SMM":  "#D62728",   # red
+    "MM":   "#17202A",   # near-black
+}
+
+
+def _compute_mm_shift(
+    coords: np.ndarray,
+    stages: np.ndarray,
+    non_stage: str = "Non",
+    mm_stage: str = "MM",
+) -> np.ndarray:
+    """Project each donor's PC coordinates onto the Non → MM centroid axis.
+
+    Returns a 1-D array (one score per donor) where:
+        Non centroid → 0
+        MM centroid  → 1
+    Values between show "fractional shift" of a donor's pathway profile from
+    the Non centroid toward the MM centroid. NaN if either centroid is missing.
+    """
+    non_mask = stages == non_stage
+    mm_mask = stages == mm_stage
+    if non_mask.sum() == 0 or mm_mask.sum() == 0:
+        return np.full(len(coords), np.nan)
+    non_centroid = coords[non_mask].mean(axis=0)
+    mm_centroid = coords[mm_mask].mean(axis=0)
+    axis = mm_centroid - non_centroid
+    axis_norm_sq = float(np.dot(axis, axis))
+    if axis_norm_sq == 0:
+        return np.full(len(coords), np.nan)
+    return (coords - non_centroid) @ axis / axis_norm_sq
+
+
+def fig6_donor_heterogeneity(
+    out_dir: Path = OUT_DIR,
+    estimator: str = "model",
+    n_components: int = 3,
+) -> dict:
+    """Donor-level heterogeneity within MM precursor stages (Q#2).
+
+    Builds two figures from donor_scores.csv (per-donor pathway activity):
+      * fig6a_donor_pca   — 2x2 PCA scatter of donors per cohort × lineage.
+      * fig6b_mm_shift    — 2x2 strip plot of per-donor MM-shift score.
+
+    Writes CSVs:
+      * donor_shift_scores.csv — per-donor shift score with PC1/PC2 and stage.
+      * fig6_shift_summary.csv — mean±std of shift score per cohort×lineage×stage.
+    """
+    try:
+        from sklearn.decomposition import PCA
+        from sklearn.preprocessing import StandardScaler
+    except ImportError as exc:
+        raise ImportError(
+            "fig6 needs scikit-learn. Install with: pip install scikit-learn"
+        ) from exc
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cohort_order = ["Zavidij_2020", "Foster_2026"]
+
+    all_shift_records: list[dict] = []
+    pca_data: dict = {}
+
+    for cohort_name in cohort_order:
+        csv_path = DONOR_SCORES_PATHS[cohort_name]
+        df = pd.read_csv(csv_path)
+        df = df[df["estimator"] == estimator]
+
+        for lineage in LINEAGES:
+            sub = df[df["lineage"] == lineage]
+            if len(sub) == 0:
+                continue
+
+            # Donor × unit pivot
+            M = sub.pivot_table(
+                index="donor_id", columns="unit", values="score", aggfunc="first"
+            )
+            donors = M.index.values
+            donor_stage_map = sub.groupby("donor_id")["stage"].first()
+            stages = donor_stage_map.loc[donors].values
+
+            # Drop zero-variance columns, then standardize
+            X = M.fillna(0.0).values
+            col_std = X.std(axis=0)
+            X = X[:, col_std > 0]
+            if X.shape[1] == 0:
+                continue
+            Xs = StandardScaler().fit_transform(X)
+
+            # PCA — cap n_components by matrix shape
+            k = min(n_components, Xs.shape[0] - 1, Xs.shape[1])
+            pca = PCA(n_components=k)
+            coords = pca.fit_transform(Xs)
+
+            # MM shift score
+            shift = _compute_mm_shift(coords, stages)
+
+            # Record per-donor
+            for idx, (donor, stage_val) in enumerate(zip(donors, stages)):
+                all_shift_records.append({
+                    "cohort": cohort_name,
+                    "lineage": lineage,
+                    "donor_id": donor,
+                    "stage": stage_val,
+                    "mm_shift": shift[idx],
+                    "pc1": coords[idx, 0],
+                    "pc2": coords[idx, 1] if coords.shape[1] > 1 else np.nan,
+                    "pc3": coords[idx, 2] if coords.shape[1] > 2 else np.nan,
+                })
+
+            pca_data[(cohort_name, lineage)] = {
+                "coords": coords,
+                "donors": donors,
+                "stages": stages,
+                "var_ratio": pca.explained_variance_ratio_,
+            }
+
+    shift_df = pd.DataFrame(all_shift_records)
+    shift_csv = out_dir / "donor_shift_scores.csv"
+    shift_df.to_csv(shift_csv, index=False)
+
+    # -------- fig6a — PCA grid --------
+    fig_a, axes_a = plt.subplots(2, 2, figsize=(13, 10))
+    for i, cohort_name in enumerate(cohort_order):
+        for j, lineage in enumerate(LINEAGES):
+            ax = axes_a[i, j]
+            key = (cohort_name, lineage)
+            if key not in pca_data:
+                ax.set_title(f"{cohort_name} — {lineage} (no data)")
+                ax.axis("off")
+                continue
+            data = pca_data[key]
+            coords = data["coords"]
+            stages = data["stages"]
+            var_ratio = data["var_ratio"]
+
+            for stage in STAGE_ORDER_FULL:
+                mask = stages == stage
+                if mask.sum() == 0:
+                    continue
+                ax.scatter(
+                    coords[mask, 0], coords[mask, 1],
+                    c=STAGE_COLORS[stage], s=120, alpha=0.80,
+                    label=f"{stage} (n={int(mask.sum())})",
+                    edgecolor="white", linewidth=1.0,
+                    zorder=3,
+                )
+
+            ax.axhline(0, color="gray", linewidth=0.4, alpha=0.5, zorder=1)
+            ax.axvline(0, color="gray", linewidth=0.4, alpha=0.5, zorder=1)
+            ax.set_xlabel(f"PC1 ({var_ratio[0] * 100:.1f}%)")
+            ax.set_ylabel(
+                f"PC2 ({var_ratio[1] * 100:.1f}%)" if len(var_ratio) > 1 else "PC2 (n/a)"
+            )
+            ax.set_title(f"{cohort_name} — {lineage}", fontsize=11)
+            ax.legend(fontsize=9, loc="best", frameon=False)
+            ax.grid(True, alpha=0.25)
+
+    fig_a.suptitle(
+        f"fig6a — Donor pathway-profile heterogeneity (PCA)\n"
+        f"estimator = {estimator}. One dot = one donor.",
+        fontsize=12, y=1.00,
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    fig_a.savefig(out_dir / "fig6a_donor_pca.pdf", bbox_inches="tight", dpi=200)
+    fig_a.savefig(out_dir / "fig6a_donor_pca.png", bbox_inches="tight", dpi=200)
+    plt.close(fig_a)
+
+    # -------- fig6b — MM-shift strip plot --------
+    fig_b, axes_b = plt.subplots(2, 2, figsize=(13, 10))
+    rng = np.random.RandomState(42)
+    for i, cohort_name in enumerate(cohort_order):
+        for j, lineage in enumerate(LINEAGES):
+            ax = axes_b[i, j]
+            sub = shift_df[
+                (shift_df["cohort"] == cohort_name)
+                & (shift_df["lineage"] == lineage)
+            ]
+            if len(sub) == 0:
+                ax.set_title(f"{cohort_name} — {lineage} (no data)")
+                ax.axis("off")
+                continue
+
+            for stage in STAGE_ORDER_FULL:
+                stage_sub = sub[sub["stage"] == stage]
+                if len(stage_sub) == 0:
+                    continue
+                x = STAGE_X_INT[stage] + rng.uniform(-0.18, 0.18, size=len(stage_sub))
+                ax.scatter(
+                    x, stage_sub["mm_shift"],
+                    c=STAGE_COLORS[stage], s=100, alpha=0.80,
+                    edgecolor="white", linewidth=0.8,
+                    label=f"{stage} (n={len(stage_sub)})",
+                    zorder=3,
+                )
+
+            ax.axhline(0, color="gray", linewidth=0.6, linestyle=":", alpha=0.7)
+            ax.axhline(1, color="gray", linewidth=0.6, linestyle=":", alpha=0.7)
+            ax.axhline(0.5, color="red", linewidth=0.4, linestyle="--", alpha=0.4)
+            ax.text(3.3, 0.0, "Non", color="gray", fontsize=9, va="center")
+            ax.text(3.3, 1.0, "MM",  color="gray", fontsize=9, va="center")
+            ax.text(3.3, 0.5, "half-shift", color="red", fontsize=8, va="center", alpha=0.7)
+
+            ax.set_xticks([0, 1, 2, 3])
+            ax.set_xticklabels(STAGE_ORDER_FULL)
+            ax.set_xlabel("Stage" if i == 1 else "")
+            ax.set_ylabel(
+                "MM-shift score" if j == 0 else ""
+            )
+            ax.set_title(f"{cohort_name} — {lineage}", fontsize=11)
+            ax.set_xlim(-0.4, 3.9)
+            ax.grid(True, alpha=0.25)
+
+    fig_b.suptitle(
+        "fig6b — Donor MM-shift score across stages\n"
+        "Projection onto Non → MM centroid axis (PC space). "
+        "0 = Non centroid, 1 = MM centroid.",
+        fontsize=12, y=1.00,
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    fig_b.savefig(out_dir / "fig6b_mm_shift.pdf", bbox_inches="tight", dpi=200)
+    fig_b.savefig(out_dir / "fig6b_mm_shift.png", bbox_inches="tight", dpi=200)
+    plt.close(fig_b)
+
+    # Summary table
+    summ = (
+        shift_df.groupby(["cohort", "lineage", "stage"])["mm_shift"]
+        .agg(["mean", "std", "min", "max", "count"])
+        .reset_index()
+    )
+    summ_csv = out_dir / "fig6_shift_summary.csv"
+    summ.to_csv(summ_csv, index=False)
+
+    # Flag MM-like precursor donors (MGUS/SMM with shift > 0.5)
+    anomalies = shift_df[
+        (shift_df["stage"].isin(["MGUS", "SMM"]))
+        & (shift_df["mm_shift"] > 0.5)
+    ].sort_values(["cohort", "lineage", "mm_shift"], ascending=[True, True, False])
+
+    print("✓ fig6_donor_heterogeneity — wrote:")
+    print(f"    {out_dir / 'fig6a_donor_pca.pdf'}")
+    print(f"    {out_dir / 'fig6a_donor_pca.png'}")
+    print(f"    {out_dir / 'fig6b_mm_shift.pdf'}")
+    print(f"    {out_dir / 'fig6b_mm_shift.png'}")
+    print(f"    {shift_csv}")
+    print(f"    {summ_csv}")
+    print()
+    print(f"Settings: estimator={estimator}, n_components={n_components}")
+    print()
+    print("Shift-score summary (mean ± std per stage):")
+    print(summ.to_string(index=False))
+    print()
+    print("MM-like precursor donors (MGUS/SMM with mm_shift > 0.5):")
+    if len(anomalies) > 0:
+        print(anomalies.to_string(index=False))
+    else:
+        print("    (none — no precursor donors crossed the half-shift threshold)")
+
+    return {
+        "shift_scores": shift_df,
+        "pca_data": pca_data,
+        "summary": summ,
+        "anomalies": anomalies,
+    }
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -383,7 +664,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Biological questions figures.")
     parser.add_argument(
         "--fig",
-        choices=["fig5", "all"],
+        choices=["fig5", "fig6", "all"],
         default="fig5",
         help="Which figure to generate (default: fig5).",
     )
@@ -401,6 +682,11 @@ def main() -> None:
     parser.add_argument("--min-signal-eps", type=float, default=0.3,
                         help="If max(|z|) < min_signal_eps, unit is classified as "
                              "low_signal (no meaningful activity anywhere).")
+    parser.add_argument("--estimator", type=str, default="model",
+                        help="(fig6) estimator column value to filter donor_scores.csv "
+                             "(default: model).")
+    parser.add_argument("--n-components", type=int, default=3,
+                        help="(fig6) number of PCA components to keep (default: 3).")
     args = parser.parse_args()
 
     if args.fig in ("fig5", "all"):
@@ -411,6 +697,11 @@ def main() -> None:
             null_eps=args.null_eps,
             peak_dominance=args.peak_dominance,
             min_signal_eps=args.min_signal_eps,
+        )
+    if args.fig in ("fig6", "all"):
+        fig6_donor_heterogeneity(
+            estimator=args.estimator,
+            n_components=args.n_components,
         )
 
 
